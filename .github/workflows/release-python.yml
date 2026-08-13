@@ -47,11 +47,12 @@ jobs:
             3.11
             3.12
             3.13
+            3.14
       - name: Build wheels
         uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.target.target }}
-          args: --release --out dist --interpreter python3.9 python3.10 python3.11 python3.12 python3.13 --manifest-path pybigtools/Cargo.toml --no-default-features ${{ matrix.target.remote && '--features remote' || '' }}
+          args: --release --out dist --find-interpreter --manifest-path pybigtools/Cargo.toml --no-default-features ${{ matrix.target.remote && '--features remote' || '' }}
           #sccache: 'true'
           manylinux: '2_28'
       - name: Upload wheels
@@ -77,12 +78,13 @@ jobs:
             3.11
             3.12
             3.13
+            3.14
           architecture: ${{ matrix.target }}
       - name: Build wheels
         uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.target }}
-          args: --release --out dist --interpreter python3.9 python3.10 python3.11 python3.12 python3.13 --manifest-path pybigtools/Cargo.toml
+          args: --release --out dist --find-interpreter --manifest-path pybigtools/Cargo.toml
           #sccache: 'true'
       - name: Upload wheels
         uses: actions/upload-artifact@v4
@@ -107,11 +109,12 @@ jobs:
             3.11
             3.12
             3.13
+            3.14
       - name: Build wheels
         uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.target }}
-          args: --release --out dist --interpreter python3.9 python3.10 python3.11 python3.12 python3.13 --manifest-path pybigtools/Cargo.toml
+          args: --release --out dist --find-interpreter --manifest-path pybigtools/Cargo.toml
           #sccache: 'true'
       - name: Upload wheels
         uses: actions/upload-artifact@v4
