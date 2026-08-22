@@ -155,11 +155,12 @@ fn test_primary_data_block_layout() -> Result<(), Box<dyn Error>> {
         read_calls: Rc::clone(&read_calls),
     })?
     .cached();
+    drop(cached_reader.get_interval("chr17", 59_000, 60_000)?);
     let reads_before_traversal = read_calls.get();
     let first = cached_reader.data_blocks()?;
-    let reads_after_first_traversal = read_calls.get();
-    assert!(reads_after_first_traversal > reads_before_traversal);
+    assert_eq!(read_calls.get(), reads_before_traversal);
     let second = cached_reader.data_blocks()?;
+    assert_eq!(read_calls.get(), reads_before_traversal);
     assert_eq!(first, second);
 
     let mut uncached_reader = BigWigRead::open_file(dir.join("valid.bigWig"))?;

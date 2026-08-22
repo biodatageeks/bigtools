@@ -448,12 +448,14 @@ pub(crate) fn cir_tree_data_blocks<R: BBIFileRead>(
     let mut blocks = Vec::new();
     let mut remaining_nodes = VecDeque::with_capacity(2048);
     let mut visited_nodes = HashSet::new();
+    let mut children = Vec::with_capacity(256);
     remaining_nodes.push_front(at.1);
     visited_nodes.insert(at.1);
 
     while let Some(node_offset) = remaining_nodes.pop_front() {
-        let children = file.data_blocks_for_cir_tree_node(endianness, node_offset, &mut blocks)?;
-        for child in children.into_iter().rev() {
+        children.clear();
+        file.data_blocks_for_cir_tree_node(endianness, node_offset, &mut blocks, &mut children)?;
+        for child in children.drain(..).rev() {
             if !visited_nodes.insert(child) {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -469,30 +471,33 @@ pub(crate) fn cir_tree_data_blocks<R: BBIFileRead>(
 fn append_node_data_blocks<L, N>(
     iter: CirTreeNodeIterator<L, N>,
     blocks: &mut Vec<BBIDataBlock>,
-) -> SmallVec<[u64; 4]>
-where
+    children: &mut Vec<u64>,
+) where
     L: Iterator<Item = CirTreeNodeLeaf>,
     N: Iterator<Item = CirTreeNodeNonLeaf>,
 {
     match iter {
         CirTreeNodeIterator::Leaf(items) => {
             blocks.extend(items.map(|leaf| data_block_from_leaf(&leaf)));
-            SmallVec::new()
         }
-        CirTreeNodeIterator::NonLeaf(items) => items.map(|child| child.node_offset).collect(),
+        CirTreeNodeIterator::NonLeaf(items) => {
+            children.extend(items.map(|child| child.node_offset));
+        }
     }
 }
 
 fn append_cached_node_data_blocks(
     node: &Either<Vec<CirTreeNodeLeaf>, Vec<CirTreeNodeNonLeaf>>,
     blocks: &mut Vec<BBIDataBlock>,
-) -> SmallVec<[u64; 4]> {
+    children: &mut Vec<u64>,
+) {
     match node {
         Either::Left(items) => {
             blocks.extend(items.iter().map(data_block_from_leaf));
-            SmallVec::new()
         }
-        Either::Right(items) => items.iter().map(|child| child.node_offset).collect(),
+        Either::Right(items) => {
+            children.extend(items.iter().map(|child| child.node_offset));
+        }
     }
 }
 
@@ -622,7 +627,7 @@ pub trait BBIFileRead {
         end: u32,
     ) -> io::Result<(SmallVec<[u64; 4]>, SmallVec<[Block; 4]>)>;
 
-    /// Append a cir-tree node's primary data blocks and return its child nodes.
+    /// Append a cir-tree node's primary data blocks and child node offsets.
     ///
     /// Full-index traversals use this method. Implementations that cache or
     /// prefetch parsed cir-tree nodes can override the default reader behavior.
@@ -631,9 +636,11 @@ pub trait BBIFileRead {
         endianness: Endianness,
         node_offset: u64,
         blocks: &mut Vec<BBIDataBlock>,
-    ) -> io::Result<SmallVec<[u64; 4]>> {
+        children: &mut Vec<u64>,
+    ) -> io::Result<()> {
         let iter = read_node(self.raw_reader(), node_offset, endianness)?;
-        Ok(append_node_data_blocks(iter, blocks))
+        append_node_data_blocks(iter, blocks, children);
+        Ok(())
     }
 
     fn raw_reader(&mut self) -> &mut Self::Reader;
@@ -748,13 +755,16 @@ impl<S: SeekableRead> BBIFileRead for CachedBBIFileRead<S> {
         endianness: Endianness,
         node_offset: u64,
         blocks: &mut Vec<BBIDataBlock>,
-    ) -> io::Result<SmallVec<[u64; 4]>> {
+        children: &mut Vec<u64>,
+    ) -> io::Result<()> {
         if let Some(node) = self.cir_tree_node_map.get(&node_offset) {
-            return Ok(append_cached_node_data_blocks(node, blocks));
+            append_cached_node_data_blocks(node, blocks, children);
+            return Ok(());
         }
 
         let iter = read_node(&mut self.read, node_offset, endianness)?;
-        Ok(append_node_data_blocks(iter, blocks))
+        append_node_data_blocks(iter, blocks, children);
+        Ok(())
     }
 
     fn raw_reader(&mut self) -> &mut Self::Reader {
@@ -797,9 +807,10 @@ mod data_block_tests {
             .cir_tree_node_map
             .insert(64, Either::Left(Vec::new()));
         let mut blocks = Vec::new();
+        let mut children = Vec::new();
 
-        let children = reader
-            .data_blocks_for_cir_tree_node(Endianness::Little, 0, &mut blocks)
+        reader
+            .data_blocks_for_cir_tree_node(Endianness::Little, 0, &mut blocks, &mut children)
             .unwrap();
 
         assert!(children.is_empty());
@@ -842,6 +853,17 @@ mod data_block_tests {
         let bigbed_path = directory.join("bigGenePred.bb");
         let mut uncached_bigbed = BigBedRead::open_file(&bigbed_path).unwrap();
         let expected_bigbed = uncached_bigbed.data_blocks().unwrap();
+
+        let mut narrow_cached_bigbed = BigBedRead::open_file(&bigbed_path).unwrap().cached();
+        let first_chromosome = narrow_cached_bigbed.chroms()[0].name.clone();
+        drop(
+            narrow_cached_bigbed
+                .get_interval(&first_chromosome, 1_000_000, 1_001_000)
+                .unwrap(),
+        );
+        assert!(narrow_cached_bigbed.read.cir_tree_node_map.len() >= 2);
+        assert_eq!(narrow_cached_bigbed.data_blocks().unwrap(), expected_bigbed);
+
         let mut cached_bigbed = BigBedRead::open_file(bigbed_path).unwrap().cached();
         let bigbed_chromosomes: Vec<_> = cached_bigbed
             .chroms()

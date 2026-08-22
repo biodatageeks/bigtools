@@ -270,7 +270,8 @@ impl<R: BBIFileRead> BigBedRead<R> {
     /// multiple range requests. Cached readers reuse parsed nodes already in
     /// their query cache without filling that cache with the full traversal.
     /// Blocks are returned in cir-tree index order, which is coordinate order
-    /// for well-formed files.
+    /// for well-formed files. The returned vector uses memory proportional to
+    /// the number of primary data blocks.
     pub fn data_blocks(&mut self) -> Result<Vec<BBIDataBlock>, BBIReadError> {
         let cir_tree = self.full_data_cir_tree()?;
         cir_tree_data_blocks(self.info.header.endianness, &mut self.read, cir_tree)
