@@ -80,7 +80,11 @@ fn test_reduction_values() -> Result<(), Box<dyn Error>> {
 
 #[test]
 fn test_primary_data_block_layout() -> Result<(), Box<dyn Error>> {
+    use std::cell::Cell;
+    use std::fs::File;
+    use std::io::{self, Read, Seek, SeekFrom};
     use std::path::PathBuf;
+    use std::rc::Rc;
 
     use bigtools::{BigBedRead, BigWigRead};
 
@@ -101,8 +105,8 @@ fn test_primary_data_block_layout() -> Result<(), Box<dyn Error>> {
 
         assert!(!blocks.is_empty(), "{file_name} should contain data blocks");
         assert!(
-            blocks.iter().all(|block| block.compressed_size > 0),
-            "{file_name} reported an empty compressed block"
+            blocks.iter().all(|block| block.data_size > 0),
+            "{file_name} reported an empty data block"
         );
         assert!(blocks.windows(2).all(|pair| {
             (pair[0].start_chrom_id, pair[0].start_base)
@@ -112,6 +116,35 @@ fn test_primary_data_block_layout() -> Result<(), Box<dyn Error>> {
             chrom_ids.contains(&block.start_chrom_id) && chrom_ids.contains(&block.end_chrom_id)
         }));
     }
+
+    struct CountingRead {
+        inner: File,
+        read_calls: Rc<Cell<usize>>,
+    }
+
+    impl Read for CountingRead {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            self.read_calls.set(self.read_calls.get() + 1);
+            self.inner.read(buffer)
+        }
+    }
+
+    impl Seek for CountingRead {
+        fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+            self.inner.seek(position)
+        }
+    }
+
+    let read_calls = Rc::new(Cell::new(0));
+    let mut cached_reader = BigWigRead::open(CountingRead {
+        inner: File::open(dir.join("valid.bigWig"))?,
+        read_calls: Rc::clone(&read_calls),
+    })?
+    .cached();
+    cached_reader.data_blocks()?;
+    let reads_after_first_traversal = read_calls.get();
+    cached_reader.data_blocks()?;
+    assert_eq!(read_calls.get(), reads_after_first_traversal);
 
     Ok(())
 }

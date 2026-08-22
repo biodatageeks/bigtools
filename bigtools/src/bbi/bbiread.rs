@@ -28,7 +28,7 @@ pub struct Block {
     pub(crate) size: u64,
 }
 
-/// Coordinate and compressed-size metadata for one primary BBI data block.
+/// Coordinate and on-disk size metadata for one primary BBI data block.
 ///
 /// The chromosome identifiers correspond to [`ChromInfo::id`]. A block can
 /// span a chromosome boundary, so both its start and end chromosome are
@@ -40,7 +40,8 @@ pub struct BBIDataBlock {
     pub start_base: u32,
     pub end_chrom_id: u32,
     pub end_base: u32,
-    pub compressed_size: u64,
+    /// Number of bytes occupied by the encoded data block in the BBI file.
+    pub data_size: u64,
 }
 
 impl Block {
@@ -445,22 +446,11 @@ pub(crate) fn cir_tree_data_blocks<R: BBIFileRead>(
     remaining_nodes.push_front(at.1);
 
     while let Some(node_offset) = remaining_nodes.pop_front() {
-        match read_node(file.raw_reader(), node_offset, endianness)? {
-            CirTreeNodeIterator::Leaf(iter) => {
-                blocks.extend(iter.map(|leaf| BBIDataBlock {
-                    start_chrom_id: leaf.start_chrom_ix,
-                    start_base: leaf.start_base,
-                    end_chrom_id: leaf.end_chrom_ix,
-                    end_base: leaf.end_base,
-                    compressed_size: leaf.data_size,
-                }));
-            }
-            CirTreeNodeIterator::NonLeaf(iter) => {
-                let children = iter.collect::<Vec<_>>();
-                for child in children.into_iter().rev() {
-                    remaining_nodes.push_front(child.node_offset);
-                }
-            }
+        let (children, node_blocks) =
+            file.data_blocks_for_cir_tree_node(endianness, node_offset)?;
+        blocks.extend(node_blocks);
+        for child in children {
+            remaining_nodes.push_front(child);
         }
     }
 
@@ -473,6 +463,32 @@ pub(crate) fn cir_tree_data_blocks<R: BBIFileRead>(
         )
     });
     Ok(blocks)
+}
+
+fn node_data_blocks<L, N>(
+    iter: CirTreeNodeIterator<L, N>,
+) -> (SmallVec<[u64; 4]>, Vec<BBIDataBlock>)
+where
+    L: Iterator<Item = CirTreeNodeLeaf>,
+    N: Iterator<Item = CirTreeNodeNonLeaf>,
+{
+    match iter {
+        CirTreeNodeIterator::Leaf(items) => (
+            SmallVec::new(),
+            items
+                .map(|leaf| BBIDataBlock {
+                    start_chrom_id: leaf.start_chrom_ix,
+                    start_base: leaf.start_base,
+                    end_chrom_id: leaf.end_chrom_ix,
+                    end_base: leaf.end_base,
+                    data_size: leaf.data_size,
+                })
+                .collect(),
+        ),
+        CirTreeNodeIterator::NonLeaf(items) => {
+            (items.map(|child| child.node_offset).collect(), Vec::new())
+        }
+    }
 }
 
 pub enum GenericBBIRead<R> {
@@ -590,6 +606,15 @@ pub trait BBIFileRead {
         end: u32,
     ) -> io::Result<(SmallVec<[u64; 4]>, SmallVec<[Block; 4]>)>;
 
+    fn data_blocks_for_cir_tree_node(
+        &mut self,
+        endianness: Endianness,
+        node_offset: u64,
+    ) -> io::Result<(SmallVec<[u64; 4]>, Vec<BBIDataBlock>)> {
+        let iter = read_node(self.raw_reader(), node_offset, endianness)?;
+        Ok(node_data_blocks(iter))
+    }
+
     fn raw_reader(&mut self) -> &mut Self::Reader;
 }
 
@@ -695,6 +720,32 @@ impl<S: SeekableRead> BBIFileRead for CachedBBIFileRead<S> {
                 Ok(nodes_overlapping(iter, chrom_ix, start, end))
             }
         }
+    }
+
+    fn data_blocks_for_cir_tree_node(
+        &mut self,
+        endianness: Endianness,
+        node_offset: u64,
+    ) -> io::Result<(SmallVec<[u64; 4]>, Vec<BBIDataBlock>)> {
+        let iter = match self.cir_tree_node_map.entry(node_offset) {
+            Entry::Occupied(node) => match node.get() {
+                Either::Left(items) => CirTreeNodeIterator::Leaf(items.clone().into_iter()),
+                Either::Right(items) => CirTreeNodeIterator::NonLeaf(items.clone().into_iter()),
+            },
+            Entry::Vacant(entry) => match read_node(&mut self.read, node_offset, endianness)? {
+                CirTreeNodeIterator::Leaf(items) => {
+                    let items: Vec<_> = items.collect();
+                    entry.insert(Either::Left(items.clone()));
+                    CirTreeNodeIterator::Leaf(items.into_iter())
+                }
+                CirTreeNodeIterator::NonLeaf(items) => {
+                    let items: Vec<_> = items.collect();
+                    entry.insert(Either::Right(items.clone()));
+                    CirTreeNodeIterator::NonLeaf(items.into_iter())
+                }
+            },
+        };
+        Ok(node_data_blocks(iter))
     }
 
     fn raw_reader(&mut self) -> &mut Self::Reader {
