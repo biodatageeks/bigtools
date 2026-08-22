@@ -499,21 +499,23 @@ pub(crate) fn cir_tree_data_blocks<R: BBIFileRead>(
     file: &mut R,
     at: CirTreeIndex,
     limits: BBIDataBlockLimits,
-) -> io::Result<Vec<BBIDataBlock>> {
+    primary_data_start: u64,
+    primary_data_end: u64,
+) -> Result<Vec<BBIDataBlock>, BBIReadError> {
     // The header counts data records/sections, not cir-tree leaf entries. It is
     // therefore an upper bound for blocks, not a count that the layout must
     // equal. It does not bound internal nodes, whose count also depends on the
     // cir-tree fanout, so nodes use only the independent safety limit and the
     // structural index-span bound below.
     let item_count = at.2;
+    if item_count == 0 {
+        return Ok(Vec::new());
+    }
     let mut max_nodes = limits.max_nodes;
     let mut max_blocks = item_count.min(limits.max_blocks);
     if let Some(index_end) = at.3 {
         let index_span = index_end.checked_sub(at.1).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "cir-tree index end precedes its root",
-            )
+            BBIReadError::InvalidFile("cir-tree index end precedes its root".into())
         })?;
         max_nodes = max_nodes.min(index_span / 4);
         max_blocks = max_blocks.min(index_span / 32);
@@ -526,19 +528,39 @@ pub(crate) fn cir_tree_data_blocks<R: BBIFileRead>(
     remaining_nodes.push_front(at.1);
     visited_nodes.insert(at.1);
     if max_nodes == 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "cir-tree node limit exceeded",
+        return Err(BBIReadError::InvalidFile(
+            "cir-tree node limit exceeded".into(),
         ));
     }
 
     while let Some(node_offset) = remaining_nodes.pop_front() {
         children.clear();
-        file.data_blocks_for_cir_tree_node(endianness, node_offset, &mut blocks, &mut children)?;
+        let first_new_block = blocks.len();
+        file.data_blocks_for_cir_tree_node(endianness, node_offset, &mut blocks, &mut children)
+            .map_err(|error| {
+                if error.kind() == io::ErrorKind::InvalidData {
+                    BBIReadError::InvalidFile(error.to_string())
+                } else {
+                    BBIReadError::IoError(error)
+                }
+            })?;
+        for block in &blocks[first_new_block..] {
+            let data_end = block.offset.checked_add(block.data_size).ok_or_else(|| {
+                BBIReadError::InvalidFile("cir-tree data block range overflows".into())
+            })?;
+            if block.data_size == 0
+                || block.offset < primary_data_start
+                || data_end > primary_data_end
+            {
+                return Err(BBIReadError::InvalidFile(format!(
+                    "cir-tree data block [{}, {}) lies outside primary data [{}, {})",
+                    block.offset, data_end, primary_data_start, primary_data_end
+                )));
+            }
+        }
         if u64::try_from(blocks.len()).unwrap_or(u64::MAX) > max_blocks {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "cir-tree data block limit exceeded",
+            return Err(BBIReadError::InvalidFile(
+                "cir-tree data block limit exceeded".into(),
             ));
         }
         for child in children.drain(..).rev() {
@@ -546,21 +568,18 @@ pub(crate) fn cir_tree_data_blocks<R: BBIFileRead>(
                 .checked_add(4)
                 .is_some_and(|child_end| at.3.map_or(true, |index_end| child_end <= index_end));
             if child < at.1 || !child_header_in_range {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "cir-tree child node offset out of range",
+                return Err(BBIReadError::InvalidFile(
+                    "cir-tree child node offset out of range".into(),
                 ));
             }
             if !visited_nodes.insert(child) {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "cir-tree contains a repeated child node offset",
+                return Err(BBIReadError::InvalidFile(
+                    "cir-tree contains a repeated child node offset".into(),
                 ));
             }
             if u64::try_from(visited_nodes.len()).unwrap_or(u64::MAX) > max_nodes {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "cir-tree node limit exceeded",
+                return Err(BBIReadError::InvalidFile(
+                    "cir-tree node limit exceeded".into(),
                 ));
             }
             remaining_nodes.push_front(child);
@@ -919,6 +938,13 @@ mod data_block_tests {
         bytes
     }
 
+    fn invalid_file_message(error: BBIReadError) -> String {
+        match error {
+            BBIReadError::InvalidFile(message) => message,
+            other => panic!("expected invalid-file error, got {other}"),
+        }
+    }
+
     #[test]
     fn full_traversal_does_not_pollute_query_cache() {
         let mut reader = CachedBBIFileRead::new(Cursor::new(little_endian_leaf_node()));
@@ -1008,12 +1034,13 @@ mod data_block_tests {
             &mut reader,
             CirTreeIndex(CirTreeIndexType::FullData, 48, 2, Some(120)),
             BBIDataBlockLimits::default(),
+            128,
+            192,
         )
         .unwrap_err();
 
-        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert_eq!(
-            error.to_string(),
+            invalid_file_message(error),
             "cir-tree contains a repeated child node offset"
         );
     }
@@ -1032,11 +1059,15 @@ mod data_block_tests {
             &mut reader,
             CirTreeIndex(CirTreeIndexType::FullData, 48, 1, Some(116)),
             BBIDataBlockLimits::default(),
+            128,
+            192,
         )
         .unwrap_err();
 
-        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-        assert_eq!(error.to_string(), "cir-tree data block limit exceeded");
+        assert_eq!(
+            invalid_file_message(error),
+            "cir-tree data block limit exceeded"
+        );
     }
 
     #[test]
@@ -1055,11 +1086,12 @@ mod data_block_tests {
                 max_nodes: 2,
                 ..BBIDataBlockLimits::default()
             },
+            128,
+            192,
         )
         .unwrap_err();
 
-        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-        assert_eq!(error.to_string(), "cir-tree node limit exceeded");
+        assert_eq!(invalid_file_message(error), "cir-tree node limit exceeded");
     }
 
     #[test]
@@ -1075,6 +1107,8 @@ mod data_block_tests {
             &mut reader,
             CirTreeIndex(CirTreeIndexType::FullData, 48, 1, Some(156)),
             BBIDataBlockLimits::default(),
+            128,
+            192,
         )
         .unwrap();
 
@@ -1093,11 +1127,101 @@ mod data_block_tests {
             &mut reader,
             CirTreeIndex(CirTreeIndexType::FullData, 48, 2, Some(84)),
             BBIDataBlockLimits::default(),
+            128,
+            192,
         )
         .unwrap_err();
 
-        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-        assert_eq!(error.to_string(), "cir-tree child node offset out of range");
+        assert_eq!(
+            invalid_file_message(error),
+            "cir-tree child node offset out of range"
+        );
+    }
+
+    #[test]
+    fn full_traversal_returns_empty_layout_for_empty_index() {
+        let mut reader = Cursor::new(little_endian_cir_tree_header(0));
+
+        let blocks = cir_tree_data_blocks(
+            Endianness::Little,
+            &mut reader,
+            CirTreeIndex(CirTreeIndexType::FullData, 48, 0, Some(48)),
+            BBIDataBlockLimits::default(),
+            8,
+            48,
+        )
+        .unwrap();
+
+        assert!(blocks.is_empty());
+    }
+
+    #[test]
+    fn full_traversal_rejects_invalid_node_tag_without_panicking() {
+        let mut bytes = little_endian_cir_tree_header(1);
+        bytes.extend_from_slice(&[2, 0, 0, 0]);
+        let mut reader = Cursor::new(bytes);
+
+        let error = cir_tree_data_blocks(
+            Endianness::Little,
+            &mut reader,
+            CirTreeIndex(CirTreeIndexType::FullData, 48, 1, Some(52)),
+            BBIDataBlockLimits::default(),
+            128,
+            192,
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            invalid_file_message(error),
+            "cir-tree node has invalid leaf flag 2"
+        );
+    }
+
+    #[test]
+    fn full_traversal_rejects_data_block_outside_primary_data() {
+        let mut bytes = little_endian_cir_tree_header(1);
+        bytes.extend_from_slice(&little_endian_leaf_node());
+        let mut reader = Cursor::new(bytes);
+
+        let error = cir_tree_data_blocks(
+            Endianness::Little,
+            &mut reader,
+            CirTreeIndex(CirTreeIndexType::FullData, 48, 1, Some(84)),
+            BBIDataBlockLimits::default(),
+            192,
+            256,
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            invalid_file_message(error),
+            "cir-tree data block [128, 192) lies outside primary data [192, 256)"
+        );
+    }
+
+    #[test]
+    fn full_traversal_rejects_overflowing_data_block_range() {
+        let mut leaf = little_endian_leaf_node();
+        leaf[20..28].copy_from_slice(&u64::MAX.to_le_bytes());
+        leaf[28..36].copy_from_slice(&2_u64.to_le_bytes());
+        let mut bytes = little_endian_cir_tree_header(1);
+        bytes.extend_from_slice(&leaf);
+        let mut reader = Cursor::new(bytes);
+
+        let error = cir_tree_data_blocks(
+            Endianness::Little,
+            &mut reader,
+            CirTreeIndex(CirTreeIndexType::FullData, 48, 1, Some(84)),
+            BBIDataBlockLimits::default(),
+            128,
+            256,
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            invalid_file_message(error),
+            "cir-tree data block range overflows"
+        );
     }
 
     #[test]
@@ -1702,7 +1826,12 @@ pub(crate) fn read_node<R: SeekableRead>(
     }
 
     let isleaf: u8 = header_data.get_u8();
-    assert!(isleaf == 1 || isleaf == 0, "Unexpected isleaf: {}", isleaf);
+    if isleaf > 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("cir-tree node has invalid leaf flag {isleaf}"),
+        ));
+    }
     let _reserved = header_data.get_u8();
 
     let count = match endianness {
