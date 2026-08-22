@@ -22,6 +22,8 @@ use crate::{BigBedRead, BigWigRead};
 
 use self::internal::BBIReadInternal;
 
+const MAX_CACHED_CIR_TREE_NODES: usize = 5_000;
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Block {
     pub(crate) offset: u64,
@@ -35,11 +37,14 @@ pub struct Block {
 /// reported. Reading this layout only traverses the cir-tree index; it does not
 /// read or decompress the primary data blocks.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct BBIDataBlock {
     pub start_chrom_id: u32,
     pub start_base: u32,
     pub end_chrom_id: u32,
     pub end_base: u32,
+    /// Byte offset of the encoded data block in the BBI file.
+    pub offset: u64,
     /// Number of bytes occupied by the encoded data block in the BBI file.
     pub data_size: u64,
 }
@@ -449,19 +454,10 @@ pub(crate) fn cir_tree_data_blocks<R: BBIFileRead>(
         let (children, node_blocks) =
             file.data_blocks_for_cir_tree_node(endianness, node_offset)?;
         blocks.extend(node_blocks);
-        for child in children {
+        for child in children.into_iter().rev() {
             remaining_nodes.push_front(child);
         }
     }
-
-    blocks.sort_unstable_by_key(|block| {
-        (
-            block.start_chrom_id,
-            block.start_base,
-            block.end_chrom_id,
-            block.end_base,
-        )
-    });
     Ok(blocks)
 }
 
@@ -475,19 +471,37 @@ where
     match iter {
         CirTreeNodeIterator::Leaf(items) => (
             SmallVec::new(),
-            items
-                .map(|leaf| BBIDataBlock {
-                    start_chrom_id: leaf.start_chrom_ix,
-                    start_base: leaf.start_base,
-                    end_chrom_id: leaf.end_chrom_ix,
-                    end_base: leaf.end_base,
-                    data_size: leaf.data_size,
-                })
-                .collect(),
+            items.map(|leaf| data_block_from_leaf(&leaf)).collect(),
         ),
         CirTreeNodeIterator::NonLeaf(items) => {
             (items.map(|child| child.node_offset).collect(), Vec::new())
         }
+    }
+}
+
+fn cached_node_data_blocks(
+    node: &Either<Vec<CirTreeNodeLeaf>, Vec<CirTreeNodeNonLeaf>>,
+) -> (SmallVec<[u64; 4]>, Vec<BBIDataBlock>) {
+    match node {
+        Either::Left(items) => (
+            SmallVec::new(),
+            items.iter().map(data_block_from_leaf).collect(),
+        ),
+        Either::Right(items) => (
+            items.iter().map(|child| child.node_offset).collect(),
+            Vec::new(),
+        ),
+    }
+}
+
+fn data_block_from_leaf(leaf: &CirTreeNodeLeaf) -> BBIDataBlock {
+    BBIDataBlock {
+        start_chrom_id: leaf.start_chrom_ix,
+        start_base: leaf.start_base,
+        end_chrom_id: leaf.end_chrom_ix,
+        end_base: leaf.end_base,
+        offset: leaf.data_offset,
+        data_size: leaf.data_size,
     }
 }
 
@@ -727,25 +741,20 @@ impl<S: SeekableRead> BBIFileRead for CachedBBIFileRead<S> {
         endianness: Endianness,
         node_offset: u64,
     ) -> io::Result<(SmallVec<[u64; 4]>, Vec<BBIDataBlock>)> {
-        let iter = match self.cir_tree_node_map.entry(node_offset) {
-            Entry::Occupied(node) => match node.get() {
-                Either::Left(items) => CirTreeNodeIterator::Leaf(items.clone().into_iter()),
-                Either::Right(items) => CirTreeNodeIterator::NonLeaf(items.clone().into_iter()),
-            },
-            Entry::Vacant(entry) => match read_node(&mut self.read, node_offset, endianness)? {
-                CirTreeNodeIterator::Leaf(items) => {
-                    let items: Vec<_> = items.collect();
-                    entry.insert(Either::Left(items.clone()));
-                    CirTreeNodeIterator::Leaf(items.into_iter())
-                }
-                CirTreeNodeIterator::NonLeaf(items) => {
-                    let items: Vec<_> = items.collect();
-                    entry.insert(Either::Right(items.clone()));
-                    CirTreeNodeIterator::NonLeaf(items.into_iter())
-                }
-            },
+        if self.cir_tree_node_map.len() >= MAX_CACHED_CIR_TREE_NODES {
+            self.cir_tree_node_map.clear();
+        }
+        let node = match self.cir_tree_node_map.entry(node_offset) {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => {
+                let node = match read_node(&mut self.read, node_offset, endianness)? {
+                    CirTreeNodeIterator::Leaf(items) => Either::Left(items.collect()),
+                    CirTreeNodeIterator::NonLeaf(items) => Either::Right(items.collect()),
+                };
+                entry.insert(node)
+            }
         };
-        Ok(node_data_blocks(iter))
+        Ok(cached_node_data_blocks(node))
     }
 
     fn raw_reader(&mut self) -> &mut Self::Reader {

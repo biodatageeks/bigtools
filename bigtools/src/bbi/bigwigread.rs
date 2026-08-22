@@ -285,6 +285,10 @@ where
 
     /// Return the primary-data cir-tree leaf layout without reading or
     /// decompressing the represented data blocks.
+    ///
+    /// This traverses the complete primary index. Remote readers can require
+    /// multiple range requests; cached readers reuse parsed nodes while
+    /// bounding the number retained in memory.
     pub fn data_blocks(&mut self) -> Result<Vec<BBIDataBlock>, BBIReadError> {
         let cir_tree = self.full_data_cir_tree()?;
         cir_tree_data_blocks(self.info.header.endianness, &mut self.read, cir_tree)

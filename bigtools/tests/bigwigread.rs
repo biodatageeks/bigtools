@@ -91,9 +91,12 @@ fn test_primary_data_block_layout() -> Result<(), Box<dyn Error>> {
     let mut dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     dir.push("resources/test");
 
-    for (file_name, is_bigwig) in [("valid.bigWig", true), ("bigGenePred.bb", false)] {
+    for (file_name, is_bigwig, expected_blocks, expected_data_size) in [
+        ("valid.bigWig", true, 98, 603_252),
+        ("bigGenePred.bb", false, 456, 6_226_427),
+    ] {
         let path = dir.join(file_name);
-        let (blocks, chrom_ids) = if is_bigwig {
+        let (blocks, chrom_ids): (Vec<bigtools::BBIDataBlock>, Vec<u32>) = if is_bigwig {
             let mut reader = BigWigRead::open_file(path)?;
             let chrom_ids: Vec<_> = reader.chroms().iter().map(|chrom| chrom.id()).collect();
             (reader.data_blocks()?, chrom_ids)
@@ -103,9 +106,15 @@ fn test_primary_data_block_layout() -> Result<(), Box<dyn Error>> {
             (reader.data_blocks()?, chrom_ids)
         };
 
-        assert!(!blocks.is_empty(), "{file_name} should contain data blocks");
+        assert_eq!(blocks.len(), expected_blocks);
+        assert_eq!(
+            blocks.iter().map(|block| block.data_size).sum::<u64>(),
+            expected_data_size
+        );
         assert!(
-            blocks.iter().all(|block| block.data_size > 0),
+            blocks
+                .iter()
+                .all(|block| block.offset > 0 && block.data_size > 0),
             "{file_name} reported an empty data block"
         );
         assert!(blocks.windows(2).all(|pair| {
@@ -114,6 +123,9 @@ fn test_primary_data_block_layout() -> Result<(), Box<dyn Error>> {
         }));
         assert!(blocks.iter().all(|block| {
             chrom_ids.contains(&block.start_chrom_id) && chrom_ids.contains(&block.end_chrom_id)
+        }));
+        assert!(blocks.iter().all(|block| {
+            block.start_chrom_id < block.end_chrom_id || block.start_base <= block.end_base
         }));
     }
 
@@ -141,10 +153,16 @@ fn test_primary_data_block_layout() -> Result<(), Box<dyn Error>> {
         read_calls: Rc::clone(&read_calls),
     })?
     .cached();
-    cached_reader.data_blocks()?;
+    let reads_before_traversal = read_calls.get();
+    let first = cached_reader.data_blocks()?;
     let reads_after_first_traversal = read_calls.get();
-    cached_reader.data_blocks()?;
+    assert!(reads_after_first_traversal > reads_before_traversal);
+    let second = cached_reader.data_blocks()?;
     assert_eq!(read_calls.get(), reads_after_first_traversal);
+    assert_eq!(first, second);
+
+    let mut uncached_reader = BigWigRead::open_file(dir.join("valid.bigWig"))?;
+    assert_eq!(first, uncached_reader.data_blocks()?);
 
     Ok(())
 }
