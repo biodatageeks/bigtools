@@ -28,6 +28,21 @@ pub struct Block {
     pub(crate) size: u64,
 }
 
+/// Coordinate and compressed-size metadata for one primary BBI data block.
+///
+/// The chromosome identifiers correspond to [`ChromInfo::id`]. A block can
+/// span a chromosome boundary, so both its start and end chromosome are
+/// reported. Reading this layout only traverses the cir-tree index; it does not
+/// read or decompress the primary data blocks.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct BBIDataBlock {
+    pub start_chrom_id: u32,
+    pub start_base: u32,
+    pub end_chrom_id: u32,
+    pub end_base: u32,
+    pub compressed_size: u64,
+}
+
 impl Block {
     pub fn size(&self) -> u64 {
         self.size
@@ -71,6 +86,13 @@ pub struct ChromInfo {
     pub name: String,
     pub length: u32,
     pub(crate) id: u32,
+}
+
+impl ChromInfo {
+    /// Return the chromosome identifier used by the BBI cir-tree index.
+    pub fn id(&self) -> u32 {
+        self.id
+    }
 }
 
 impl PartialEq for ChromInfo {
@@ -408,6 +430,48 @@ pub(crate) fn search_cir_tree_inner<R: BBIFileRead>(
         blocks.extend(i);
     }
 
+    Ok(blocks)
+}
+
+/// Traverse a cir-tree and return every primary data-block leaf in coordinate
+/// order without reading or decompressing block contents.
+pub(crate) fn cir_tree_data_blocks<R: BBIFileRead>(
+    endianness: Endianness,
+    file: &mut R,
+    at: CirTreeIndex,
+) -> io::Result<Vec<BBIDataBlock>> {
+    let mut blocks = Vec::new();
+    let mut remaining_nodes = VecDeque::with_capacity(2048);
+    remaining_nodes.push_front(at.1);
+
+    while let Some(node_offset) = remaining_nodes.pop_front() {
+        match read_node(file.raw_reader(), node_offset, endianness)? {
+            CirTreeNodeIterator::Leaf(iter) => {
+                blocks.extend(iter.map(|leaf| BBIDataBlock {
+                    start_chrom_id: leaf.start_chrom_ix,
+                    start_base: leaf.start_base,
+                    end_chrom_id: leaf.end_chrom_ix,
+                    end_base: leaf.end_base,
+                    compressed_size: leaf.data_size,
+                }));
+            }
+            CirTreeNodeIterator::NonLeaf(iter) => {
+                let children = iter.collect::<Vec<_>>();
+                for child in children.into_iter().rev() {
+                    remaining_nodes.push_front(child.node_offset);
+                }
+            }
+        }
+    }
+
+    blocks.sort_unstable_by_key(|block| {
+        (
+            block.start_chrom_id,
+            block.start_base,
+            block.end_chrom_id,
+            block.end_base,
+        )
+    });
     Ok(blocks)
 }
 
