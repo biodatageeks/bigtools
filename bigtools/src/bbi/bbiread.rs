@@ -22,6 +22,9 @@ use crate::{BigBedRead, BigWigRead};
 
 use self::internal::BBIReadInternal;
 
+const MAX_CIR_TREE_LAYOUT_NODES: u64 = 1_000_000;
+const MAX_CIR_TREE_LAYOUT_BLOCKS: u64 = 10_000_000;
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Block {
     pub(crate) offset: u64,
@@ -459,8 +462,12 @@ pub(crate) fn cir_tree_data_blocks<R: BBIFileRead>(
     file: &mut R,
     at: CirTreeIndex,
 ) -> io::Result<Vec<BBIDataBlock>> {
+    // The header counts data records/sections, not cir-tree leaf entries. It is
+    // therefore an upper bound for blocks, not a count that the layout must
+    // equal. Independent caps keep a forged header from disabling the bounds.
     let item_count = at.2;
-    let max_nodes = item_count.saturating_add(1);
+    let max_nodes = item_count.saturating_add(1).min(MAX_CIR_TREE_LAYOUT_NODES);
+    let max_blocks = item_count.min(MAX_CIR_TREE_LAYOUT_BLOCKS);
 
     let mut blocks = Vec::new();
     let mut remaining_nodes = VecDeque::with_capacity(2048);
@@ -472,10 +479,10 @@ pub(crate) fn cir_tree_data_blocks<R: BBIFileRead>(
     while let Some(node_offset) = remaining_nodes.pop_front() {
         children.clear();
         file.data_blocks_for_cir_tree_node(endianness, node_offset, &mut blocks, &mut children)?;
-        if u64::try_from(blocks.len()).unwrap_or(u64::MAX) > item_count {
+        if u64::try_from(blocks.len()).unwrap_or(u64::MAX) > max_blocks {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "cir-tree contains more data blocks than declared",
+                "cir-tree data block limit exceeded",
             ));
         }
         for child in children.drain(..).rev() {
@@ -488,7 +495,7 @@ pub(crate) fn cir_tree_data_blocks<R: BBIFileRead>(
             if u64::try_from(visited_nodes.len()).unwrap_or(u64::MAX) > max_nodes {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    "cir-tree contains more nodes than declared items",
+                    "cir-tree node limit exceeded",
                 ));
             }
             remaining_nodes.push_front(child);
@@ -962,10 +969,26 @@ mod data_block_tests {
         .unwrap_err();
 
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-        assert_eq!(
-            error.to_string(),
-            "cir-tree contains more data blocks than declared"
-        );
+        assert_eq!(error.to_string(), "cir-tree data block limit exceeded");
+    }
+
+    #[test]
+    fn full_traversal_enforces_node_limit() {
+        let mut bytes = little_endian_cir_tree_header(1);
+        bytes.extend_from_slice(&little_endian_non_leaf_node(84));
+        bytes.extend_from_slice(&little_endian_non_leaf_node(120));
+        bytes.extend_from_slice(&little_endian_non_leaf_node(156));
+        let mut reader = Cursor::new(bytes);
+
+        let error = cir_tree_data_blocks(
+            Endianness::Little,
+            &mut reader,
+            CirTreeIndex(CirTreeIndexType::FullData, 48, 1),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(error.to_string(), "cir-tree node limit exceeded");
     }
 
     #[test]
