@@ -267,8 +267,8 @@ impl<R: BBIFileRead> BigBedRead<R> {
     /// decompressing the represented data blocks.
     ///
     /// This traverses the complete primary index. Remote readers can require
-    /// multiple range requests; cached readers reuse parsed nodes while
-    /// bounding the number retained in memory.
+    /// multiple range requests. Cached readers reuse parsed nodes already in
+    /// their query cache without filling that cache with the full traversal.
     pub fn data_blocks(&mut self) -> Result<Vec<BBIDataBlock>, BBIReadError> {
         let cir_tree = self.full_data_cir_tree()?;
         cir_tree_data_blocks(self.info.header.endianness, &mut self.read, cir_tree)

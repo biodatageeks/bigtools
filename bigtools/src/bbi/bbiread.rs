@@ -1,6 +1,6 @@
 use std::borrow::BorrowMut;
 use std::collections::hash_map::Entry;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::vec::Vec;
@@ -21,8 +21,6 @@ use crate::utils::reopen::{Reopen, ReopenableFile, SeekableRead};
 use crate::{BigBedRead, BigWigRead};
 
 use self::internal::BBIReadInternal;
-
-const MAX_CACHED_CIR_TREE_NODES: usize = 5_000;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Block {
@@ -448,49 +446,52 @@ pub(crate) fn cir_tree_data_blocks<R: BBIFileRead>(
 ) -> io::Result<Vec<BBIDataBlock>> {
     let mut blocks = Vec::new();
     let mut remaining_nodes = VecDeque::with_capacity(2048);
+    let mut visited_nodes = HashSet::new();
     remaining_nodes.push_front(at.1);
+    visited_nodes.insert(at.1);
 
     while let Some(node_offset) = remaining_nodes.pop_front() {
-        let (children, node_blocks) =
-            file.data_blocks_for_cir_tree_node(endianness, node_offset)?;
-        blocks.extend(node_blocks);
+        let children = file.data_blocks_for_cir_tree_node(endianness, node_offset, &mut blocks)?;
         for child in children.into_iter().rev() {
+            if child <= node_offset || !visited_nodes.insert(child) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "cir-tree contains an invalid or repeated child node offset",
+                ));
+            }
             remaining_nodes.push_front(child);
         }
     }
     Ok(blocks)
 }
 
-fn node_data_blocks<L, N>(
+fn append_node_data_blocks<L, N>(
     iter: CirTreeNodeIterator<L, N>,
-) -> (SmallVec<[u64; 4]>, Vec<BBIDataBlock>)
+    blocks: &mut Vec<BBIDataBlock>,
+) -> SmallVec<[u64; 4]>
 where
     L: Iterator<Item = CirTreeNodeLeaf>,
     N: Iterator<Item = CirTreeNodeNonLeaf>,
 {
     match iter {
-        CirTreeNodeIterator::Leaf(items) => (
-            SmallVec::new(),
-            items.map(|leaf| data_block_from_leaf(&leaf)).collect(),
-        ),
-        CirTreeNodeIterator::NonLeaf(items) => {
-            (items.map(|child| child.node_offset).collect(), Vec::new())
+        CirTreeNodeIterator::Leaf(items) => {
+            blocks.extend(items.map(|leaf| data_block_from_leaf(&leaf)));
+            SmallVec::new()
         }
+        CirTreeNodeIterator::NonLeaf(items) => items.map(|child| child.node_offset).collect(),
     }
 }
 
-fn cached_node_data_blocks(
+fn append_cached_node_data_blocks(
     node: &Either<Vec<CirTreeNodeLeaf>, Vec<CirTreeNodeNonLeaf>>,
-) -> (SmallVec<[u64; 4]>, Vec<BBIDataBlock>) {
+    blocks: &mut Vec<BBIDataBlock>,
+) -> SmallVec<[u64; 4]> {
     match node {
-        Either::Left(items) => (
-            SmallVec::new(),
-            items.iter().map(data_block_from_leaf).collect(),
-        ),
-        Either::Right(items) => (
-            items.iter().map(|child| child.node_offset).collect(),
-            Vec::new(),
-        ),
+        Either::Left(items) => {
+            blocks.extend(items.iter().map(data_block_from_leaf));
+            SmallVec::new()
+        }
+        Either::Right(items) => items.iter().map(|child| child.node_offset).collect(),
     }
 }
 
@@ -620,13 +621,18 @@ pub trait BBIFileRead {
         end: u32,
     ) -> io::Result<(SmallVec<[u64; 4]>, SmallVec<[Block; 4]>)>;
 
+    /// Append a cir-tree node's primary data blocks and return its child nodes.
+    ///
+    /// Full-index traversals use this method. Implementations that cache or
+    /// prefetch parsed cir-tree nodes can override the default reader behavior.
     fn data_blocks_for_cir_tree_node(
         &mut self,
         endianness: Endianness,
         node_offset: u64,
-    ) -> io::Result<(SmallVec<[u64; 4]>, Vec<BBIDataBlock>)> {
+        blocks: &mut Vec<BBIDataBlock>,
+    ) -> io::Result<SmallVec<[u64; 4]>> {
         let iter = read_node(self.raw_reader(), node_offset, endianness)?;
-        Ok(node_data_blocks(iter))
+        Ok(append_node_data_blocks(iter, blocks))
     }
 
     fn raw_reader(&mut self) -> &mut Self::Reader;
@@ -740,20 +746,14 @@ impl<S: SeekableRead> BBIFileRead for CachedBBIFileRead<S> {
         &mut self,
         endianness: Endianness,
         node_offset: u64,
-    ) -> io::Result<(SmallVec<[u64; 4]>, Vec<BBIDataBlock>)> {
+        blocks: &mut Vec<BBIDataBlock>,
+    ) -> io::Result<SmallVec<[u64; 4]>> {
         if let Some(node) = self.cir_tree_node_map.get(&node_offset) {
-            return Ok(cached_node_data_blocks(node));
+            return Ok(append_cached_node_data_blocks(node, blocks));
         }
 
-        let node = match read_node(&mut self.read, node_offset, endianness)? {
-            CirTreeNodeIterator::Leaf(items) => Either::Left(items.collect()),
-            CirTreeNodeIterator::NonLeaf(items) => Either::Right(items.collect()),
-        };
-        let result = cached_node_data_blocks(&node);
-        if self.cir_tree_node_map.len() < MAX_CACHED_CIR_TREE_NODES {
-            self.cir_tree_node_map.insert(node_offset, node);
-        }
-        Ok(result)
+        let iter = read_node(&mut self.read, node_offset, endianness)?;
+        Ok(append_node_data_blocks(iter, blocks))
     }
 
     fn raw_reader(&mut self) -> &mut Self::Reader {
@@ -772,25 +772,102 @@ impl<R: Reopen + SeekableRead> Reopen for CachedBBIFileRead<R> {
 }
 
 #[cfg(test)]
-mod cache_tests {
+mod data_block_tests {
     use std::io::Cursor;
+    use std::path::PathBuf;
 
     use super::*;
 
-    #[test]
-    fn saturated_cir_tree_cache_retains_hits() {
-        let mut reader = CachedBBIFileRead::new(Cursor::new(Vec::<u8>::new()));
-        reader.cir_tree_node_map.extend(
-            (0..MAX_CACHED_CIR_TREE_NODES as u64).map(|offset| (offset, Either::Left(Vec::new()))),
-        );
+    fn little_endian_leaf_node() -> Vec<u8> {
+        let mut bytes = vec![1, 0, 1, 0];
+        bytes.extend_from_slice(&2_u32.to_le_bytes());
+        bytes.extend_from_slice(&10_u32.to_le_bytes());
+        bytes.extend_from_slice(&2_u32.to_le_bytes());
+        bytes.extend_from_slice(&20_u32.to_le_bytes());
+        bytes.extend_from_slice(&128_u64.to_le_bytes());
+        bytes.extend_from_slice(&64_u64.to_le_bytes());
+        bytes
+    }
 
-        let (children, blocks) = reader
-            .data_blocks_for_cir_tree_node(Endianness::Little, 0)
+    #[test]
+    fn full_traversal_does_not_pollute_query_cache() {
+        let mut reader = CachedBBIFileRead::new(Cursor::new(little_endian_leaf_node()));
+        reader
+            .cir_tree_node_map
+            .insert(64, Either::Left(Vec::new()));
+        let mut blocks = Vec::new();
+
+        let children = reader
+            .data_blocks_for_cir_tree_node(Endianness::Little, 0, &mut blocks)
             .unwrap();
 
         assert!(children.is_empty());
-        assert!(blocks.is_empty());
-        assert_eq!(reader.cir_tree_node_map.len(), MAX_CACHED_CIR_TREE_NODES);
+        assert_eq!(
+            blocks,
+            vec![BBIDataBlock {
+                start_chrom_id: 2,
+                start_base: 10,
+                end_chrom_id: 2,
+                end_base: 20,
+                offset: 128,
+                data_size: 64,
+            }]
+        );
+        assert_eq!(reader.cir_tree_node_map.len(), 1);
+        assert!(reader.cir_tree_node_map.contains_key(&64));
+        assert!(!reader.cir_tree_node_map.contains_key(&0));
+    }
+
+    #[test]
+    fn full_traversal_rejects_cyclic_index() {
+        let mut bytes = vec![0, 0, 1, 0];
+        bytes.extend_from_slice(&0_u32.to_le_bytes());
+        bytes.extend_from_slice(&0_u32.to_le_bytes());
+        bytes.extend_from_slice(&0_u32.to_le_bytes());
+        bytes.extend_from_slice(&1_u32.to_le_bytes());
+        bytes.extend_from_slice(&0_u64.to_le_bytes());
+        bytes.extend_from_slice(&[0; 8]);
+        let mut reader = Cursor::new(bytes);
+
+        let error = cir_tree_data_blocks(
+            Endianness::Little,
+            &mut reader,
+            CirTreeIndex(CirTreeIndexType::FullData, 0),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn layout_matches_blocks_used_by_full_range_queries() {
+        let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        path.push("resources/test/valid.bigWig");
+        let mut reader = BigWigRead::open_file(path).unwrap();
+        let layout: HashSet<_> = reader
+            .data_blocks()
+            .unwrap()
+            .into_iter()
+            .map(|block| (block.offset, block.data_size))
+            .collect();
+        let chromosomes: Vec<_> = reader
+            .chroms()
+            .iter()
+            .map(|chrom| (chrom.name.clone(), chrom.length))
+            .collect();
+        let mut query_blocks = HashSet::new();
+
+        for (name, length) in chromosomes {
+            let tree = match reader.full_data_cir_tree() {
+                Ok(tree) => tree,
+                Err(_) => panic!("fixture should contain a valid cir-tree"),
+            };
+            let blocks =
+                search_cir_tree(&reader.info, &mut reader.read, tree, &name, 0, length).unwrap();
+            query_blocks.extend(blocks.into_iter().map(|block| (block.offset, block.size)));
+        }
+
+        assert_eq!(layout, query_blocks);
     }
 }
 
