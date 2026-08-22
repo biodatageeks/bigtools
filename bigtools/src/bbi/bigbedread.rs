@@ -283,13 +283,7 @@ impl<R: BBIFileRead> BigBedRead<R> {
         &mut self,
         limits: BBIDataBlockLimits,
     ) -> Result<Vec<BBIDataBlock>, BBIReadError> {
-        let primary_data_start = self.info.header.full_data_offset;
-        let primary_data_end = self.info.header.full_index_offset;
-        if primary_data_start > primary_data_end {
-            return Err(BBIReadError::InvalidFile(
-                "primary data region is invalid".into(),
-            ));
-        }
+        let (primary_data_start, primary_data_end) = self.info.header.primary_data_bounds()?;
         let cir_tree = self.full_data_cir_tree()?;
         cir_tree_data_blocks(
             self.info.header.endianness,
