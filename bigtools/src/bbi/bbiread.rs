@@ -502,9 +502,11 @@ pub(crate) fn cir_tree_data_blocks<R: BBIFileRead>(
 ) -> io::Result<Vec<BBIDataBlock>> {
     // The header counts data records/sections, not cir-tree leaf entries. It is
     // therefore an upper bound for blocks, not a count that the layout must
-    // equal. Independent caps keep a forged header from disabling the bounds.
+    // equal. It does not bound internal nodes, whose count also depends on the
+    // cir-tree fanout, so nodes use only the independent safety limit and the
+    // structural index-span bound below.
     let item_count = at.2;
-    let mut max_nodes = item_count.saturating_add(1).min(limits.max_nodes);
+    let mut max_nodes = limits.max_nodes;
     let mut max_blocks = item_count.min(limits.max_blocks);
     if let Some(index_end) = at.3 {
         let index_span = index_end.checked_sub(at.1).ok_or_else(|| {
@@ -1049,12 +1051,35 @@ mod data_block_tests {
             Endianness::Little,
             &mut reader,
             CirTreeIndex(CirTreeIndexType::FullData, 48, 1, None),
-            BBIDataBlockLimits::default(),
+            BBIDataBlockLimits {
+                max_nodes: 2,
+                ..BBIDataBlockLimits::default()
+            },
         )
         .unwrap_err();
 
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert_eq!(error.to_string(), "cir-tree node limit exceeded");
+    }
+
+    #[test]
+    fn full_traversal_does_not_derive_node_limit_from_item_count() {
+        let mut bytes = little_endian_cir_tree_header(1);
+        bytes.extend_from_slice(&little_endian_non_leaf_node(84));
+        bytes.extend_from_slice(&little_endian_non_leaf_node(120));
+        bytes.extend_from_slice(&little_endian_leaf_node());
+        let mut reader = Cursor::new(bytes);
+
+        let blocks = cir_tree_data_blocks(
+            Endianness::Little,
+            &mut reader,
+            CirTreeIndex(CirTreeIndexType::FullData, 48, 1, Some(156)),
+            BBIDataBlockLimits::default(),
+        )
+        .unwrap();
+
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].offset, 128);
     }
 
     #[test]
