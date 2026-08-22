@@ -741,20 +741,19 @@ impl<S: SeekableRead> BBIFileRead for CachedBBIFileRead<S> {
         endianness: Endianness,
         node_offset: u64,
     ) -> io::Result<(SmallVec<[u64; 4]>, Vec<BBIDataBlock>)> {
-        if self.cir_tree_node_map.len() >= MAX_CACHED_CIR_TREE_NODES {
-            self.cir_tree_node_map.clear();
+        if let Some(node) = self.cir_tree_node_map.get(&node_offset) {
+            return Ok(cached_node_data_blocks(node));
         }
-        let node = match self.cir_tree_node_map.entry(node_offset) {
-            Entry::Occupied(entry) => entry.into_mut(),
-            Entry::Vacant(entry) => {
-                let node = match read_node(&mut self.read, node_offset, endianness)? {
-                    CirTreeNodeIterator::Leaf(items) => Either::Left(items.collect()),
-                    CirTreeNodeIterator::NonLeaf(items) => Either::Right(items.collect()),
-                };
-                entry.insert(node)
-            }
+
+        let node = match read_node(&mut self.read, node_offset, endianness)? {
+            CirTreeNodeIterator::Leaf(items) => Either::Left(items.collect()),
+            CirTreeNodeIterator::NonLeaf(items) => Either::Right(items.collect()),
         };
-        Ok(cached_node_data_blocks(node))
+        let result = cached_node_data_blocks(&node);
+        if self.cir_tree_node_map.len() < MAX_CACHED_CIR_TREE_NODES {
+            self.cir_tree_node_map.insert(node_offset, node);
+        }
+        Ok(result)
     }
 
     fn raw_reader(&mut self) -> &mut Self::Reader {
@@ -769,6 +768,29 @@ impl<R: Reopen + SeekableRead> Reopen for CachedBBIFileRead<R> {
             cir_tree_node_map: self.cir_tree_node_map.clone(),
             block_data: self.block_data.clone(),
         })
+    }
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use std::io::Cursor;
+
+    use super::*;
+
+    #[test]
+    fn saturated_cir_tree_cache_retains_hits() {
+        let mut reader = CachedBBIFileRead::new(Cursor::new(Vec::<u8>::new()));
+        reader.cir_tree_node_map.extend(
+            (0..MAX_CACHED_CIR_TREE_NODES as u64).map(|offset| (offset, Either::Left(Vec::new()))),
+        );
+
+        let (children, blocks) = reader
+            .data_blocks_for_cir_tree_node(Endianness::Little, 0)
+            .unwrap();
+
+        assert!(children.is_empty());
+        assert!(blocks.is_empty());
+        assert_eq!(reader.cir_tree_node_map.len(), MAX_CACHED_CIR_TREE_NODES);
     }
 }
 
