@@ -437,8 +437,9 @@ pub(crate) fn search_cir_tree_inner<R: BBIFileRead>(
     Ok(blocks)
 }
 
-/// Traverse a cir-tree and return every primary data-block leaf in coordinate
-/// order without reading or decompressing block contents.
+/// Traverse a cir-tree and return every primary data-block leaf in index order
+/// (coordinate order for a well-formed cir-tree) without reading or
+/// decompressing block contents.
 pub(crate) fn cir_tree_data_blocks<R: BBIFileRead>(
     endianness: Endianness,
     file: &mut R,
@@ -453,10 +454,10 @@ pub(crate) fn cir_tree_data_blocks<R: BBIFileRead>(
     while let Some(node_offset) = remaining_nodes.pop_front() {
         let children = file.data_blocks_for_cir_tree_node(endianness, node_offset, &mut blocks)?;
         for child in children.into_iter().rev() {
-            if child <= node_offset || !visited_nodes.insert(child) {
+            if !visited_nodes.insert(child) {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    "cir-tree contains an invalid or repeated child node offset",
+                    "cir-tree contains a repeated child node offset",
                 ));
             }
             remaining_nodes.push_front(child);
@@ -816,6 +817,42 @@ mod data_block_tests {
         assert_eq!(reader.cir_tree_node_map.len(), 1);
         assert!(reader.cir_tree_node_map.contains_key(&64));
         assert!(!reader.cir_tree_node_map.contains_key(&0));
+    }
+
+    #[test]
+    fn full_traversal_reuses_complete_query_cache_nodes() {
+        let mut directory = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        directory.push("resources/test");
+
+        let bigwig_path = directory.join("valid.bigWig");
+        let mut uncached_bigwig = BigWigRead::open_file(&bigwig_path).unwrap();
+        let expected_bigwig = uncached_bigwig.data_blocks().unwrap();
+        let mut cached_bigwig = BigWigRead::open_file(bigwig_path).unwrap().cached();
+        let bigwig_chromosomes: Vec<_> = cached_bigwig
+            .chroms()
+            .iter()
+            .map(|chrom| (chrom.name.clone(), chrom.length))
+            .collect();
+        for (name, length) in bigwig_chromosomes {
+            drop(cached_bigwig.get_interval(&name, 0, length).unwrap());
+        }
+        assert_eq!(cached_bigwig.read.cir_tree_node_map.len(), 1);
+        assert_eq!(cached_bigwig.data_blocks().unwrap(), expected_bigwig);
+
+        let bigbed_path = directory.join("bigGenePred.bb");
+        let mut uncached_bigbed = BigBedRead::open_file(&bigbed_path).unwrap();
+        let expected_bigbed = uncached_bigbed.data_blocks().unwrap();
+        let mut cached_bigbed = BigBedRead::open_file(bigbed_path).unwrap().cached();
+        let bigbed_chromosomes: Vec<_> = cached_bigbed
+            .chroms()
+            .iter()
+            .map(|chrom| (chrom.name.clone(), chrom.length))
+            .collect();
+        for (name, length) in bigbed_chromosomes {
+            drop(cached_bigbed.get_interval(&name, 0, length).unwrap());
+        }
+        assert_eq!(cached_bigbed.read.cir_tree_node_map.len(), 3);
+        assert_eq!(cached_bigbed.data_blocks().unwrap(), expected_bigbed);
     }
 
     #[test]

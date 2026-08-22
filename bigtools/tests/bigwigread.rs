@@ -160,7 +160,6 @@ fn test_primary_data_block_layout() -> Result<(), Box<dyn Error>> {
     let reads_after_first_traversal = read_calls.get();
     assert!(reads_after_first_traversal > reads_before_traversal);
     let second = cached_reader.data_blocks()?;
-    assert!(read_calls.get() > reads_after_first_traversal);
     assert_eq!(first, second);
 
     let mut uncached_reader = BigWigRead::open_file(dir.join("valid.bigWig"))?;
