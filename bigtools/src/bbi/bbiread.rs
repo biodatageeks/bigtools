@@ -553,15 +553,17 @@ pub(crate) fn cir_tree_data_blocks<R: BBIFileRead>(
     // cir-tree fanout, so nodes use only the independent safety limit and the
     // structural index-span bound below.
     let item_count = at.2;
-    let mut max_nodes = limits.max_nodes;
-    let mut max_blocks = item_count.min(limits.max_blocks);
+    let mut structural_max_nodes = u64::MAX;
+    let mut structural_max_blocks = item_count;
     if let Some(index_end) = at.3 {
         let index_span = index_end.checked_sub(at.1).ok_or_else(|| {
             BBIReadError::InvalidFile("cir-tree index end precedes its root".into())
         })?;
-        max_nodes = max_nodes.min(index_span / 4);
-        max_blocks = max_blocks.min(index_span / 32);
+        structural_max_nodes = index_span / 4;
+        structural_max_blocks = structural_max_blocks.min(index_span / 32);
     }
+    let max_nodes = limits.max_nodes.min(structural_max_nodes);
+    let max_blocks = limits.max_blocks.min(structural_max_blocks);
     if item_count == 0 {
         return Ok(Vec::new());
     }
@@ -573,9 +575,12 @@ pub(crate) fn cir_tree_data_blocks<R: BBIFileRead>(
     remaining_nodes.push_front(at.1);
     visited_nodes.insert(at.1);
     if max_nodes == 0 {
-        return Err(BBIReadError::InvalidFile(
-            "cir-tree node limit exceeded".into(),
-        ));
+        let message = if structural_max_nodes == 0 {
+            "cir-tree node count exceeds structural index bound"
+        } else {
+            "cir-tree node limit exceeded"
+        };
+        return Err(BBIReadError::InvalidFile(message.into()));
     }
 
     while let Some(node_offset) = remaining_nodes.pop_front() {
@@ -612,10 +617,14 @@ pub(crate) fn cir_tree_data_blocks<R: BBIFileRead>(
                 )));
             }
         }
-        if u64::try_from(blocks.len()).unwrap_or(u64::MAX) > max_blocks {
-            return Err(BBIReadError::InvalidFile(
-                "cir-tree data block limit exceeded".into(),
-            ));
+        let block_count = u64::try_from(blocks.len()).unwrap_or(u64::MAX);
+        if block_count > max_blocks {
+            let message = if block_count > structural_max_blocks {
+                "cir-tree data block count exceeds structural bound"
+            } else {
+                "cir-tree data block limit exceeded"
+            };
+            return Err(BBIReadError::InvalidFile(message.into()));
         }
         for child in children.drain(..).rev() {
             let child_header_in_range = child
@@ -631,10 +640,14 @@ pub(crate) fn cir_tree_data_blocks<R: BBIFileRead>(
                     "cir-tree contains a repeated child node offset".into(),
                 ));
             }
-            if u64::try_from(visited_nodes.len()).unwrap_or(u64::MAX) > max_nodes {
-                return Err(BBIReadError::InvalidFile(
-                    "cir-tree node limit exceeded".into(),
-                ));
+            let node_count = u64::try_from(visited_nodes.len()).unwrap_or(u64::MAX);
+            if node_count > max_nodes {
+                let message = if node_count > structural_max_nodes {
+                    "cir-tree node count exceeds structural index bound"
+                } else {
+                    "cir-tree node limit exceeded"
+                };
+                return Err(BBIReadError::InvalidFile(message.into()));
             }
             remaining_nodes.push_front(child);
         }
@@ -1125,9 +1138,10 @@ mod data_block_tests {
         )
         .unwrap_err();
 
+        assert!(!error.is_data_block_traversal_limit_exceeded());
         assert_eq!(
             invalid_file_message(error),
-            "cir-tree data block limit exceeded"
+            "cir-tree data block count exceeds structural bound"
         );
     }
 
@@ -1153,6 +1167,27 @@ mod data_block_tests {
         .unwrap_err();
 
         assert_eq!(invalid_file_message(error), "cir-tree node limit exceeded");
+    }
+
+    #[test]
+    fn full_traversal_does_not_classify_structural_node_bound_as_limit() {
+        let mut reader = Cursor::new(little_endian_cir_tree_header(1));
+
+        let error = cir_tree_data_blocks(
+            Endianness::Little,
+            &mut reader,
+            CirTreeIndex(CirTreeIndexType::FullData, 48, 1, Some(51)),
+            BBIDataBlockLimits::default(),
+            128,
+            192,
+        )
+        .unwrap_err();
+
+        assert!(!error.is_data_block_traversal_limit_exceeded());
+        assert_eq!(
+            invalid_file_message(error),
+            "cir-tree node count exceeds structural index bound"
+        );
     }
 
     #[test]

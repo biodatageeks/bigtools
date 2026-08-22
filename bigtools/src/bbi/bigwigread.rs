@@ -364,8 +364,12 @@ where
         end: u32,
     ) -> Result<BigWigIntervalIter<R, &'a mut BigWigRead<R>>, BBIReadError> {
         let chrom = self.info.chrom_id(chrom_name)?;
-        let cir_tree = self.full_data_cir_tree()?;
-        let blocks = search_cir_tree(&self.info, &mut self.read, cir_tree, chrom_name, start, end)?;
+        let blocks = if start >= end {
+            Vec::new()
+        } else {
+            let cir_tree = self.full_data_cir_tree()?;
+            search_cir_tree(&self.info, &mut self.read, cir_tree, chrom_name, start, end)?
+        };
         Ok(BigWigIntervalIter {
             r: std::marker::PhantomData,
             bigwig: self,
@@ -391,8 +395,12 @@ where
         end: u32,
     ) -> Result<BigWigIntervalIter<R, &'a mut BigWigRead<R>>, BBIReadError> {
         let chrom = self.info.chrom_id(chrom_name)?;
-        let cir_tree = self.full_data_cir_tree()?;
-        let blocks = search_cir_tree(&self.info, &mut self.read, cir_tree, chrom_name, start, end)?;
+        let blocks = if start >= end {
+            Vec::new()
+        } else {
+            let cir_tree = self.full_data_cir_tree()?;
+            search_cir_tree(&self.info, &mut self.read, cir_tree, chrom_name, start, end)?
+        };
         Ok(BigWigIntervalIter {
             r: std::marker::PhantomData,
             bigwig: self,
@@ -414,8 +422,12 @@ where
         end: u32,
     ) -> Result<BigWigIntervalIter<R, BigWigRead<R>>, BBIReadError> {
         let chrom = self.info.chrom_id(chrom_name)?;
-        let cir_tree = self.full_data_cir_tree()?;
-        let blocks = search_cir_tree(&self.info, &mut self.read, cir_tree, chrom_name, start, end)?;
+        let blocks = if start >= end {
+            Vec::new()
+        } else {
+            let cir_tree = self.full_data_cir_tree()?;
+            search_cir_tree(&self.info, &mut self.read, cir_tree, chrom_name, start, end)?
+        };
         Ok(BigWigIntervalIter {
             r: std::marker::PhantomData,
             bigwig: self,
@@ -435,8 +447,12 @@ where
         end: u32,
     ) -> Result<BigWigIntervalIter<R, BigWigRead<R>>, BBIReadError> {
         let chrom = self.info.chrom_id(chrom_name)?;
-        let cir_tree = self.full_data_cir_tree()?;
-        let blocks = search_cir_tree(&self.info, &mut self.read, cir_tree, chrom_name, start, end)?;
+        let blocks = if start >= end {
+            Vec::new()
+        } else {
+            let cir_tree = self.full_data_cir_tree()?;
+            search_cir_tree(&self.info, &mut self.read, cir_tree, chrom_name, start, end)?
+        };
         Ok(BigWigIntervalIter {
             r: std::marker::PhantomData,
             bigwig: self,

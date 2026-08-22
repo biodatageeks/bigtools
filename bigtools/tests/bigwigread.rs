@@ -16,6 +16,10 @@ fn classifies_data_block_traversal_limits() {
         !BBIReadError::InvalidFile("cir-tree child node offset out of range".into())
             .is_data_block_traversal_limit_exceeded()
     );
+    assert!(!BBIReadError::InvalidFile(
+        "cir-tree data block count exceeds structural bound".into()
+    )
+    .is_data_block_traversal_limit_exceeded());
 }
 
 #[test]
@@ -30,7 +34,7 @@ fn test_valid_read() -> Result<(), Box<dyn Error>> {
     let mut valid_bigwig = dir.clone();
     valid_bigwig.push("valid.bigWig");
 
-    let mut bwread = BigWigRead::open_file(valid_bigwig).unwrap();
+    let mut bwread = BigWigRead::open_file(&valid_bigwig).unwrap();
 
     // Test that chrom tree parsing works
     let chroms = bwread.chroms();
@@ -61,6 +65,22 @@ fn test_valid_read() -> Result<(), Box<dyn Error>> {
     assert_eq!(first_interval.start, 59898);
     assert_eq!(first_interval.end, 59900);
     assert_eq!(first_interval.value, 0.06792);
+
+    assert_eq!(bwread.get_interval("chr17", 59899, 59899)?.count(), 0);
+    assert_eq!(
+        bwread
+            .get_interval_unclipped("chr17", 59899, 59899)?
+            .count(),
+        0
+    );
+
+    let moved_reader = BigWigRead::open_file(valid_bigwig).unwrap();
+    assert_eq!(
+        moved_reader
+            .get_interval_move_unclipped("chr17", 59899, 59899)?
+            .count(),
+        0
+    );
 
     Ok(())
 }
