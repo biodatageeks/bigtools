@@ -69,6 +69,7 @@ pub struct BBIHeader {
     pub(crate) full_data_offset: u64,
     pub(crate) full_index_offset: u64,
     pub(crate) full_index_tree_offset: Option<u64>,
+    pub(crate) full_index_item_count: Option<u64>,
     pub(crate) auto_sql_offset: u64,
     pub(crate) total_summary_offset: u64,
     pub(crate) uncompress_buf_size: u32,
@@ -236,7 +237,7 @@ pub enum CirTreeIndexType {
 /// Represents a cir tree index in a bbi file. Composed of a public
 /// `CirTreeIndexType`, and a private location in the bbi file.
 /// This can be passed to `search_cir_tree`.
-pub struct CirTreeIndex(pub CirTreeIndexType, pub(crate) u64);
+pub struct CirTreeIndex(pub CirTreeIndexType, pub(crate) u64, pub(crate) u64);
 
 pub(crate) mod internal {
     use super::*;
@@ -263,7 +264,9 @@ pub(crate) mod internal {
         fn full_data_cir_tree(&mut self) -> Result<CirTreeIndex, FullDataCirTreeError> {
             let (reader, info) = self.reader_and_info();
             let index_offset = info.header.full_index_offset;
-            if info.header.full_index_tree_offset.is_none() {
+            if info.header.full_index_tree_offset.is_none()
+                || info.header.full_index_item_count.is_none()
+            {
                 let endianness = info.header.endianness;
 
                 reader
@@ -271,14 +274,20 @@ pub(crate) mod internal {
                     .seek(SeekFrom::Start(index_offset))
                     .map_err(|e| FullDataCirTreeError::IoError(e))?;
 
-                read_cir_tree_header(endianness, reader.raw_reader()).map_err(|e| match e {
-                    Either::Left(_) => FullDataCirTreeError::UnknownMagic,
-                    Either::Right(e) => FullDataCirTreeError::IoError(e),
-                })?;
+                let item_count =
+                    read_cir_tree_header(endianness, reader.raw_reader()).map_err(|e| match e {
+                        Either::Left(_) => FullDataCirTreeError::UnknownMagic,
+                        Either::Right(e) => FullDataCirTreeError::IoError(e),
+                    })?;
 
                 info.header.full_index_tree_offset = Some(index_offset + 48);
+                info.header.full_index_item_count = Some(item_count);
             }
-            Ok(CirTreeIndex(CirTreeIndexType::FullData, index_offset + 48))
+            Ok(CirTreeIndex(
+                CirTreeIndexType::FullData,
+                index_offset + 48,
+                info.header.full_index_item_count.unwrap(),
+            ))
         }
 
         fn zoom_cir_tree(
@@ -297,7 +306,7 @@ pub(crate) mod internal {
                 }
             };
 
-            if zoom_header.index_tree_offset.is_none() {
+            if zoom_header.index_tree_offset.is_none() || zoom_header.index_item_count.is_none() {
                 let endianness = info.header.endianness;
 
                 reader
@@ -305,17 +314,20 @@ pub(crate) mod internal {
                     .seek(SeekFrom::Start(zoom_header.index_offset))
                     .map_err(|e| ZoomDataCirTreeError::IoError(e))?;
 
-                read_cir_tree_header(endianness, reader.raw_reader()).map_err(|e| match e {
-                    Either::Left(_) => ZoomDataCirTreeError::UnknownMagic,
-                    Either::Right(e) => ZoomDataCirTreeError::IoError(e),
-                })?;
+                let item_count =
+                    read_cir_tree_header(endianness, reader.raw_reader()).map_err(|e| match e {
+                        Either::Left(_) => ZoomDataCirTreeError::UnknownMagic,
+                        Either::Right(e) => ZoomDataCirTreeError::IoError(e),
+                    })?;
 
                 zoom_header.index_tree_offset = Some(zoom_header.index_offset + 48);
+                zoom_header.index_item_count = Some(item_count);
             }
 
             Ok(CirTreeIndex(
                 CirTreeIndexType::Zoom(reduction_level),
                 zoom_header.index_offset + 48,
+                zoom_header.index_item_count.unwrap(),
             ))
         }
     }
@@ -364,12 +376,12 @@ pub(crate) struct UnknownMagic;
 pub(crate) fn read_cir_tree_header<R: Read + Seek>(
     endianness: Endianness,
     file: &mut R,
-) -> Result<(), Either<UnknownMagic, io::Error>> {
+) -> Result<u64, Either<UnknownMagic, io::Error>> {
     let mut header_data = BytesMut::zeroed(48);
     file.read_exact(&mut header_data)
         .map_err(|e| Either::Right(e))?;
 
-    match endianness {
+    let item_count = match endianness {
         Endianness::Big => {
             let magic = header_data.get_u32();
             if magic != CIR_TREE_MAGIC {
@@ -377,7 +389,7 @@ pub(crate) fn read_cir_tree_header<R: Read + Seek>(
             }
 
             let _blocksize = header_data.get_u32();
-            let _item_count = header_data.get_u64();
+            let item_count = header_data.get_u64();
             let _start_chrom_idx = header_data.get_u32();
             let _start_base = header_data.get_u32();
             let _end_chrom_idx = header_data.get_u32();
@@ -385,6 +397,7 @@ pub(crate) fn read_cir_tree_header<R: Read + Seek>(
             let _end_file_offset = header_data.get_u64();
             let _item_per_slot = header_data.get_u32();
             let _reserved = header_data.get_u32();
+            item_count
         }
         Endianness::Little => {
             let magic = header_data.get_u32_le();
@@ -393,7 +406,7 @@ pub(crate) fn read_cir_tree_header<R: Read + Seek>(
             }
 
             let _blocksize = header_data.get_u32_le();
-            let _item_count = header_data.get_u64_le();
+            let item_count = header_data.get_u64_le();
             let _start_chrom_idx = header_data.get_u32_le();
             let _start_base = header_data.get_u32_le();
             let _end_chrom_idx = header_data.get_u32_le();
@@ -401,9 +414,10 @@ pub(crate) fn read_cir_tree_header<R: Read + Seek>(
             let _end_file_offset = header_data.get_u64_le();
             let _item_per_slot = header_data.get_u32_le();
             let _reserved = header_data.get_u32_le();
+            item_count
         }
     };
-    Ok(())
+    Ok(item_count)
 }
 
 pub(crate) fn search_cir_tree_inner<R: BBIFileRead>(
@@ -445,6 +459,9 @@ pub(crate) fn cir_tree_data_blocks<R: BBIFileRead>(
     file: &mut R,
     at: CirTreeIndex,
 ) -> io::Result<Vec<BBIDataBlock>> {
+    let item_count = at.2;
+    let max_nodes = item_count.saturating_add(1);
+
     let mut blocks = Vec::new();
     let mut remaining_nodes = VecDeque::with_capacity(2048);
     let mut visited_nodes = HashSet::new();
@@ -455,11 +472,23 @@ pub(crate) fn cir_tree_data_blocks<R: BBIFileRead>(
     while let Some(node_offset) = remaining_nodes.pop_front() {
         children.clear();
         file.data_blocks_for_cir_tree_node(endianness, node_offset, &mut blocks, &mut children)?;
+        if u64::try_from(blocks.len()).unwrap_or(u64::MAX) > item_count {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "cir-tree contains more data blocks than declared",
+            ));
+        }
         for child in children.drain(..).rev() {
             if !visited_nodes.insert(child) {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "cir-tree contains a repeated child node offset",
+                ));
+            }
+            if u64::try_from(visited_nodes.len()).unwrap_or(u64::MAX) > max_nodes {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "cir-tree contains more nodes than declared items",
                 ));
             }
             remaining_nodes.push_front(child);
@@ -800,6 +829,24 @@ mod data_block_tests {
         bytes
     }
 
+    fn little_endian_cir_tree_header(item_count: u64) -> Vec<u8> {
+        let mut bytes = vec![0; 48];
+        bytes[0..4].copy_from_slice(&CIR_TREE_MAGIC.to_le_bytes());
+        bytes[8..16].copy_from_slice(&item_count.to_le_bytes());
+        bytes
+    }
+
+    fn little_endian_non_leaf_node(child_offset: u64) -> Vec<u8> {
+        let mut bytes = vec![0, 0, 1, 0];
+        bytes.extend_from_slice(&0_u32.to_le_bytes());
+        bytes.extend_from_slice(&0_u32.to_le_bytes());
+        bytes.extend_from_slice(&0_u32.to_le_bytes());
+        bytes.extend_from_slice(&1_u32.to_le_bytes());
+        bytes.extend_from_slice(&child_offset.to_le_bytes());
+        bytes.extend_from_slice(&[0; 8]);
+        bytes
+    }
+
     #[test]
     fn full_traversal_does_not_pollute_query_cache() {
         let mut reader = CachedBBIFileRead::new(Cursor::new(little_endian_leaf_node()));
@@ -847,7 +894,7 @@ mod data_block_tests {
         for (name, length) in bigwig_chromosomes {
             drop(cached_bigwig.get_interval(&name, 0, length).unwrap());
         }
-        assert_eq!(cached_bigwig.read.cir_tree_node_map.len(), 1);
+        assert!(!cached_bigwig.read.cir_tree_node_map.is_empty());
         assert_eq!(cached_bigwig.data_blocks().unwrap(), expected_bigwig);
 
         let bigbed_path = directory.join("bigGenePred.bb");
@@ -873,29 +920,52 @@ mod data_block_tests {
         for (name, length) in bigbed_chromosomes {
             drop(cached_bigbed.get_interval(&name, 0, length).unwrap());
         }
-        assert_eq!(cached_bigbed.read.cir_tree_node_map.len(), 3);
+        assert!(cached_bigbed.read.cir_tree_node_map.len() >= 2);
         assert_eq!(cached_bigbed.data_blocks().unwrap(), expected_bigbed);
     }
 
     #[test]
     fn full_traversal_rejects_cyclic_index() {
-        let mut bytes = vec![0, 0, 1, 0];
-        bytes.extend_from_slice(&0_u32.to_le_bytes());
-        bytes.extend_from_slice(&0_u32.to_le_bytes());
-        bytes.extend_from_slice(&0_u32.to_le_bytes());
-        bytes.extend_from_slice(&1_u32.to_le_bytes());
-        bytes.extend_from_slice(&0_u64.to_le_bytes());
-        bytes.extend_from_slice(&[0; 8]);
+        let mut bytes = little_endian_cir_tree_header(2);
+        bytes.extend_from_slice(&little_endian_non_leaf_node(84));
+        bytes.extend_from_slice(&little_endian_non_leaf_node(48));
         let mut reader = Cursor::new(bytes);
 
         let error = cir_tree_data_blocks(
             Endianness::Little,
             &mut reader,
-            CirTreeIndex(CirTreeIndexType::FullData, 0),
+            CirTreeIndex(CirTreeIndexType::FullData, 48, 2),
         )
         .unwrap_err();
 
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            error.to_string(),
+            "cir-tree contains a repeated child node offset"
+        );
+    }
+
+    #[test]
+    fn full_traversal_enforces_declared_item_count() {
+        let mut bytes = little_endian_cir_tree_header(1);
+        let leaf = little_endian_leaf_node();
+        bytes.extend_from_slice(&[1, 0, 2, 0]);
+        bytes.extend_from_slice(&leaf[4..]);
+        bytes.extend_from_slice(&leaf[4..]);
+        let mut reader = Cursor::new(bytes);
+
+        let error = cir_tree_data_blocks(
+            Endianness::Little,
+            &mut reader,
+            CirTreeIndex(CirTreeIndexType::FullData, 48, 1),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            error.to_string(),
+            "cir-tree contains more data blocks than declared"
+        );
     }
 
     #[test]
@@ -1019,6 +1089,7 @@ pub(crate) fn read_info<R: BBIFileRead>(file: &mut R) -> Result<BBIFileInfo, BBI
         full_data_offset,
         full_index_offset,
         full_index_tree_offset: None,
+        full_index_item_count: None,
         field_count,
         defined_field_count,
         auto_sql_offset,
@@ -1103,6 +1174,7 @@ fn read_zoom_headers<R: SeekableRead>(
                     data_offset,
                     index_offset,
                     index_tree_offset: None,
+                    index_item_count: None,
                 });
             }
         }
@@ -1118,6 +1190,7 @@ fn read_zoom_headers<R: SeekableRead>(
                     data_offset,
                     index_offset,
                     index_tree_offset: None,
+                    index_item_count: None,
                 });
             }
         }

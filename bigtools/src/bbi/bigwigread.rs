@@ -287,8 +287,9 @@ where
     /// decompressing the represented data blocks.
     ///
     /// This traverses the complete primary index. Remote readers can require
-    /// multiple range requests. Cached readers reuse parsed nodes already in
-    /// their query cache without filling that cache with the full traversal.
+    /// multiple range requests and should cache nearby ranges, as BigTools'
+    /// `RemoteFile` does. Cached readers reuse parsed nodes already in their
+    /// query cache without filling that cache with the full traversal.
     /// Blocks are returned in cir-tree index order, which is coordinate order
     /// for well-formed files. The returned vector uses memory proportional to
     /// the number of primary data blocks.
