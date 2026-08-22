@@ -1,6 +1,24 @@
 use std::error::Error;
 
 #[test]
+fn classifies_data_block_traversal_limits() {
+    use bigtools::BBIReadError;
+
+    assert!(
+        BBIReadError::InvalidFile("cir-tree node limit exceeded".into())
+            .is_data_block_traversal_limit_exceeded()
+    );
+    assert!(
+        BBIReadError::InvalidFile("cir-tree data block limit exceeded".into())
+            .is_data_block_traversal_limit_exceeded()
+    );
+    assert!(
+        !BBIReadError::InvalidFile("cir-tree child node offset out of range".into())
+            .is_data_block_traversal_limit_exceeded()
+    );
+}
+
+#[test]
 fn test_valid_read() -> Result<(), Box<dyn Error>> {
     use std::path::PathBuf;
 
@@ -33,6 +51,15 @@ fn test_valid_read() -> Result<(), Box<dyn Error>> {
         .unwrap();
     assert_eq!(first_interval.start, 59898);
     assert_eq!(first_interval.end, 59899);
+    assert_eq!(first_interval.value, 0.06792);
+
+    let first_interval = bwread
+        .get_interval_unclipped("chr17", 0, 59899)?
+        .next()
+        .unwrap()
+        .unwrap();
+    assert_eq!(first_interval.start, 59898);
+    assert_eq!(first_interval.end, 59900);
     assert_eq!(first_interval.value, 0.06792);
 
     Ok(())

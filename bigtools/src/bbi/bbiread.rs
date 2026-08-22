@@ -229,6 +229,19 @@ pub enum BBIReadError {
     IoError(#[from] io::Error),
 }
 
+impl BBIReadError {
+    /// Whether a complete primary-data layout traversal stopped at a caller
+    /// safety limit rather than because the file was malformed.
+    pub fn is_data_block_traversal_limit_exceeded(&self) -> bool {
+        matches!(
+            self,
+            Self::InvalidFile(message)
+                if message == "cir-tree node limit exceeded"
+                    || message == "cir-tree data block limit exceeded"
+        )
+    }
+}
+
 impl From<CirTreeSearchError> for BBIReadError {
     fn from(value: CirTreeSearchError) -> Self {
         match value {
