@@ -110,11 +110,19 @@ impl BBIHeader {
         self.full_index_offset - self.full_data_offset
     }
 
-    pub(crate) fn primary_data_bounds(&self) -> Result<(u64, u64), BBIReadError> {
-        // The BBI primary-data section begins with a 32-bit item count.
+    pub(crate) fn primary_data_bounds(
+        &self,
+        filetype: BBIFile,
+    ) -> Result<(u64, u64), BBIReadError> {
+        // BigWig stores a 32-bit section count; BigBed stores a 64-bit item
+        // count. Primary blocks begin after that format-specific prefix.
+        let item_count_size = match filetype {
+            BBIFile::BigWig => 4,
+            BBIFile::BigBed => 8,
+        };
         let start = self
             .full_data_offset
-            .checked_add(4)
+            .checked_add(item_count_size)
             .ok_or_else(|| BBIReadError::InvalidFile("primary data start overflows".into()))?;
         // Kent-generated files place the chromosome tree before primary data,
         // while BigTools can place it between primary data and its cir-tree.
@@ -1392,14 +1400,22 @@ mod data_block_tests {
 
         let bigwig = BigWigRead::open_file(path.join("valid.bigWig")).unwrap();
         assert_eq!(
-            bigwig.info.header.primary_data_bounds().unwrap(),
+            bigwig
+                .info
+                .header
+                .primary_data_bounds(BBIFile::BigWig)
+                .unwrap(),
             (348, 603_600)
         );
 
         let bigbed = BigBedRead::open_file(path.join("bigGenePred.bb")).unwrap();
         assert_eq!(
-            bigbed.info.header.primary_data_bounds().unwrap(),
-            (25_588, 6_252_019)
+            bigbed
+                .info
+                .header
+                .primary_data_bounds(BBIFile::BigBed)
+                .unwrap(),
+            (25_592, 6_252_019)
         );
     }
 }

@@ -303,7 +303,8 @@ where
         &mut self,
         limits: BBIDataBlockLimits,
     ) -> Result<Vec<BBIDataBlock>, BBIReadError> {
-        let (primary_data_start, primary_data_end) = self.info.header.primary_data_bounds()?;
+        let (primary_data_start, primary_data_end) =
+            self.info.header.primary_data_bounds(BBIFile::BigWig)?;
         let cir_tree = self.full_data_cir_tree()?;
         cir_tree_data_blocks(
             self.info.header.endianness,
