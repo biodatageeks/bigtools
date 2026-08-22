@@ -128,15 +128,19 @@ pub struct BigWigIntervalCursor<R>(BigWigIntervalIter<R, BigWigRead<R>>);
 impl<R: BBIFileRead> BigWigIntervalCursor<R> {
     pub fn interval(&mut self, chrom_name: &str, start: u32, end: u32) -> Result<(), BBIReadError> {
         let chrom = self.0.bigwig.info.chrom_id(chrom_name)?;
-        let cir_tree = self.0.bigwig.full_data_cir_tree()?;
-        let blocks = search_cir_tree(
-            &self.0.bigwig.info,
-            &mut self.0.bigwig.read,
-            cir_tree,
-            chrom_name,
-            start,
-            end,
-        )?;
+        let blocks = if start >= end {
+            Vec::new()
+        } else {
+            let cir_tree = self.0.bigwig.full_data_cir_tree()?;
+            search_cir_tree(
+                &self.0.bigwig.info,
+                &mut self.0.bigwig.read,
+                cir_tree,
+                chrom_name,
+                start,
+                end,
+            )?
+        };
         self.0.known_offset = 0;
         self.0.blocks = blocks.into_iter();
         self.0.vals = None;
@@ -146,6 +150,24 @@ impl<R: BBIFileRead> BigWigIntervalCursor<R> {
 
     pub fn into_inner(self) -> BigWigRead<R> {
         self.0.bigwig
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::*;
+
+    #[test]
+    fn interval_cursor_treats_empty_and_inverted_ranges_as_empty() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources/test/valid.bigWig");
+        let mut cursor = BigWigRead::open_file(path).unwrap().interval_cursor();
+
+        for (start, end) in [(59_899, 59_899), (60_000, 59_899)] {
+            cursor.interval("chr17", start, end).unwrap();
+            assert!(cursor.0.next().is_none(), "range [{start}, {end})");
+        }
     }
 }
 

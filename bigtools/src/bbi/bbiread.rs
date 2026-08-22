@@ -603,6 +603,11 @@ pub(crate) fn cir_tree_data_blocks<R: BBIFileRead>(
                 BBIReadError::IoError(error)
             }
         })?;
+        if blocks.len() == first_new_block && children.is_empty() {
+            return Err(BBIReadError::InvalidFile(
+                "cir-tree contains an empty node for a nonempty index".into(),
+            ));
+        }
         for block in &blocks[first_new_block..] {
             let data_end = block.offset.checked_add(block.data_size).ok_or_else(|| {
                 BBIReadError::InvalidFile("cir-tree data block range overflows".into())
@@ -626,7 +631,9 @@ pub(crate) fn cir_tree_data_blocks<R: BBIFileRead>(
             };
             return Err(BBIReadError::InvalidFile(message.into()));
         }
-        for child in children.drain(..).rev() {
+        // Validate every sibling before enforcing the configurable node limit so
+        // malformed duplicate offsets cannot be misclassified as caller limits.
+        for &child in children.iter().rev() {
             let child_header_in_range = child
                 .checked_add(4)
                 .is_some_and(|child_end| at.3.map_or(true, |index_end| child_end <= index_end));
@@ -640,15 +647,17 @@ pub(crate) fn cir_tree_data_blocks<R: BBIFileRead>(
                     "cir-tree contains a repeated child node offset".into(),
                 ));
             }
-            let node_count = u64::try_from(visited_nodes.len()).unwrap_or(u64::MAX);
-            if node_count > max_nodes {
-                let message = if node_count > structural_max_nodes {
-                    "cir-tree node count exceeds structural index bound"
-                } else {
-                    "cir-tree node limit exceeded"
-                };
-                return Err(BBIReadError::InvalidFile(message.into()));
-            }
+        }
+        let node_count = u64::try_from(visited_nodes.len()).unwrap_or(u64::MAX);
+        if node_count > max_nodes {
+            let message = if node_count > structural_max_nodes {
+                "cir-tree node count exceeds structural index bound"
+            } else {
+                "cir-tree node limit exceeded"
+            };
+            return Err(BBIReadError::InvalidFile(message.into()));
+        }
+        for child in children.drain(..).rev() {
             remaining_nodes.push_front(child);
         }
     }
@@ -1002,13 +1011,21 @@ mod data_block_tests {
     }
 
     fn little_endian_non_leaf_node(child_offset: u64) -> Vec<u8> {
-        let mut bytes = vec![0, 0, 1, 0];
-        bytes.extend_from_slice(&0_u32.to_le_bytes());
-        bytes.extend_from_slice(&0_u32.to_le_bytes());
-        bytes.extend_from_slice(&0_u32.to_le_bytes());
-        bytes.extend_from_slice(&1_u32.to_le_bytes());
-        bytes.extend_from_slice(&child_offset.to_le_bytes());
+        let mut bytes = little_endian_non_leaf_node_children(&[child_offset]);
         bytes.extend_from_slice(&[0; 8]);
+        bytes
+    }
+
+    fn little_endian_non_leaf_node_children(child_offsets: &[u64]) -> Vec<u8> {
+        let mut bytes = vec![0, 0];
+        bytes.extend_from_slice(&(child_offsets.len() as u16).to_le_bytes());
+        for &child_offset in child_offsets {
+            bytes.extend_from_slice(&0_u32.to_le_bytes());
+            bytes.extend_from_slice(&0_u32.to_le_bytes());
+            bytes.extend_from_slice(&0_u32.to_le_bytes());
+            bytes.extend_from_slice(&1_u32.to_le_bytes());
+            bytes.extend_from_slice(&child_offset.to_le_bytes());
+        }
         bytes
     }
 
@@ -1117,6 +1134,58 @@ mod data_block_tests {
             invalid_file_message(error),
             "cir-tree contains a repeated child node offset"
         );
+    }
+
+    #[test]
+    fn full_traversal_detects_duplicate_siblings_before_caller_limit() {
+        let mut bytes = little_endian_cir_tree_header(1);
+        bytes.extend_from_slice(&little_endian_non_leaf_node_children(&[100, 100]));
+        bytes.extend_from_slice(&[1, 0, 0, 0]);
+        let mut reader = Cursor::new(bytes);
+
+        let error = cir_tree_data_blocks(
+            Endianness::Little,
+            &mut reader,
+            CirTreeIndex(CirTreeIndexType::FullData, 48, 1, Some(104)),
+            BBIDataBlockLimits {
+                max_nodes: 1,
+                ..BBIDataBlockLimits::default()
+            },
+            128,
+            192,
+        )
+        .unwrap_err();
+
+        assert!(!error.is_data_block_traversal_limit_exceeded());
+        assert_eq!(
+            invalid_file_message(error),
+            "cir-tree contains a repeated child node offset"
+        );
+    }
+
+    #[test]
+    fn full_traversal_rejects_empty_nodes_in_nonempty_index() {
+        for is_leaf in [false, true] {
+            let mut bytes = little_endian_cir_tree_header(1);
+            bytes.extend_from_slice(&[u8::from(is_leaf), 0, 0, 0]);
+            let mut reader = Cursor::new(bytes);
+
+            let error = cir_tree_data_blocks(
+                Endianness::Little,
+                &mut reader,
+                CirTreeIndex(CirTreeIndexType::FullData, 48, 1, Some(52)),
+                BBIDataBlockLimits::default(),
+                128,
+                192,
+            )
+            .unwrap_err();
+
+            assert!(!error.is_data_block_traversal_limit_exceeded());
+            assert_eq!(
+                invalid_file_message(error),
+                "cir-tree contains an empty node for a nonempty index"
+            );
+        }
     }
 
     #[test]
