@@ -50,8 +50,8 @@ use thiserror::Error;
 
 use crate::bbi::{BBIFile, Summary, Value};
 use crate::bbiread::{
-    cir_tree_data_blocks, read_info, BBIDataBlock, BBIFileInfo, BBIFileReadInfoError, BBIRead,
-    BBIReadError, Block, ChromInfo, ZoomIntervalIter,
+    cir_tree_data_blocks, read_info, BBIDataBlock, BBIDataBlockLimits, BBIFileInfo,
+    BBIFileReadInfoError, BBIRead, BBIReadError, Block, ChromInfo, ZoomIntervalIter,
 };
 use crate::internal::BBIReadInternal;
 use crate::utils::reopen::{Reopen, ReopenableFile, SeekableRead};
@@ -294,9 +294,23 @@ where
     /// for well-formed files. The returned vector uses memory proportional to
     /// the number of primary data blocks.
     pub fn data_blocks(&mut self) -> Result<Vec<BBIDataBlock>, BBIReadError> {
+        self.data_blocks_with_limits(BBIDataBlockLimits::default())
+    }
+
+    /// Return the primary-data cir-tree leaf layout with caller-supplied safety
+    /// limits. This can raise the defaults for unusually large valid files.
+    pub fn data_blocks_with_limits(
+        &mut self,
+        limits: BBIDataBlockLimits,
+    ) -> Result<Vec<BBIDataBlock>, BBIReadError> {
         let cir_tree = self.full_data_cir_tree()?;
-        cir_tree_data_blocks(self.info.header.endianness, &mut self.read, cir_tree)
-            .map_err(BBIReadError::IoError)
+        cir_tree_data_blocks(
+            self.info.header.endianness,
+            &mut self.read,
+            cir_tree,
+            limits,
+        )
+        .map_err(BBIReadError::IoError)
     }
 
     /// Returns the summary data from bigWig

@@ -50,6 +50,29 @@ pub struct BBIDataBlock {
     pub data_size: u64,
 }
 
+/// Safety limits for a complete primary-data cir-tree traversal.
+///
+/// The defaults allow 1,000,000 index nodes and 10,000,000 primary data
+/// blocks. Callers reading larger trusted files can raise either limit through
+/// [`BigWigRead::data_blocks_with_limits`] or
+/// [`BigBedRead::data_blocks_with_limits`].
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct BBIDataBlockLimits {
+    /// Maximum number of cir-tree nodes visited by the traversal.
+    pub max_nodes: u64,
+    /// Maximum number of primary data blocks returned by the traversal.
+    pub max_blocks: u64,
+}
+
+impl Default for BBIDataBlockLimits {
+    fn default() -> Self {
+        Self {
+            max_nodes: MAX_CIR_TREE_LAYOUT_NODES,
+            max_blocks: MAX_CIR_TREE_LAYOUT_BLOCKS,
+        }
+    }
+}
+
 impl Block {
     pub fn size(&self) -> u64 {
         self.size
@@ -240,7 +263,12 @@ pub enum CirTreeIndexType {
 /// Represents a cir tree index in a bbi file. Composed of a public
 /// `CirTreeIndexType`, and a private location in the bbi file.
 /// This can be passed to `search_cir_tree`.
-pub struct CirTreeIndex(pub CirTreeIndexType, pub(crate) u64, pub(crate) u64);
+pub struct CirTreeIndex(
+    pub CirTreeIndexType,
+    pub(crate) u64,
+    pub(crate) u64,
+    pub(crate) Option<u64>,
+);
 
 pub(crate) mod internal {
     use super::*;
@@ -286,10 +314,18 @@ pub(crate) mod internal {
                 info.header.full_index_tree_offset = Some(index_offset + 48);
                 info.header.full_index_item_count = Some(item_count);
             }
+            let root_offset = index_offset + 48;
+            let index_end = info
+                .zoom_headers
+                .iter()
+                .map(|header| header.data_offset)
+                .filter(|offset| *offset > root_offset)
+                .min();
             Ok(CirTreeIndex(
                 CirTreeIndexType::FullData,
-                index_offset + 48,
+                root_offset,
                 info.header.full_index_item_count.unwrap(),
+                index_end,
             ))
         }
 
@@ -331,6 +367,7 @@ pub(crate) mod internal {
                 CirTreeIndexType::Zoom(reduction_level),
                 zoom_header.index_offset + 48,
                 zoom_header.index_item_count.unwrap(),
+                None,
             ))
         }
     }
@@ -461,13 +498,24 @@ pub(crate) fn cir_tree_data_blocks<R: BBIFileRead>(
     endianness: Endianness,
     file: &mut R,
     at: CirTreeIndex,
+    limits: BBIDataBlockLimits,
 ) -> io::Result<Vec<BBIDataBlock>> {
     // The header counts data records/sections, not cir-tree leaf entries. It is
     // therefore an upper bound for blocks, not a count that the layout must
     // equal. Independent caps keep a forged header from disabling the bounds.
     let item_count = at.2;
-    let max_nodes = item_count.saturating_add(1).min(MAX_CIR_TREE_LAYOUT_NODES);
-    let max_blocks = item_count.min(MAX_CIR_TREE_LAYOUT_BLOCKS);
+    let mut max_nodes = item_count.saturating_add(1).min(limits.max_nodes);
+    let mut max_blocks = item_count.min(limits.max_blocks);
+    if let Some(index_end) = at.3 {
+        let index_span = index_end.checked_sub(at.1).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "cir-tree index end precedes its root",
+            )
+        })?;
+        max_nodes = max_nodes.min(index_span / 4);
+        max_blocks = max_blocks.min(index_span / 32);
+    }
 
     let mut blocks = Vec::new();
     let mut remaining_nodes = VecDeque::with_capacity(2048);
@@ -475,6 +523,12 @@ pub(crate) fn cir_tree_data_blocks<R: BBIFileRead>(
     let mut children = Vec::with_capacity(256);
     remaining_nodes.push_front(at.1);
     visited_nodes.insert(at.1);
+    if max_nodes == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "cir-tree node limit exceeded",
+        ));
+    }
 
     while let Some(node_offset) = remaining_nodes.pop_front() {
         children.clear();
@@ -486,6 +540,15 @@ pub(crate) fn cir_tree_data_blocks<R: BBIFileRead>(
             ));
         }
         for child in children.drain(..).rev() {
+            let child_header_in_range = child
+                .checked_add(4)
+                .is_some_and(|child_end| at.3.map_or(true, |index_end| child_end <= index_end));
+            if child < at.1 || !child_header_in_range {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "cir-tree child node offset out of range",
+                ));
+            }
             if !visited_nodes.insert(child) {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -941,7 +1004,8 @@ mod data_block_tests {
         let error = cir_tree_data_blocks(
             Endianness::Little,
             &mut reader,
-            CirTreeIndex(CirTreeIndexType::FullData, 48, 2),
+            CirTreeIndex(CirTreeIndexType::FullData, 48, 2, Some(120)),
+            BBIDataBlockLimits::default(),
         )
         .unwrap_err();
 
@@ -964,7 +1028,8 @@ mod data_block_tests {
         let error = cir_tree_data_blocks(
             Endianness::Little,
             &mut reader,
-            CirTreeIndex(CirTreeIndexType::FullData, 48, 1),
+            CirTreeIndex(CirTreeIndexType::FullData, 48, 1, Some(116)),
+            BBIDataBlockLimits::default(),
         )
         .unwrap_err();
 
@@ -983,12 +1048,31 @@ mod data_block_tests {
         let error = cir_tree_data_blocks(
             Endianness::Little,
             &mut reader,
-            CirTreeIndex(CirTreeIndexType::FullData, 48, 1),
+            CirTreeIndex(CirTreeIndexType::FullData, 48, 1, None),
+            BBIDataBlockLimits::default(),
         )
         .unwrap_err();
 
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert_eq!(error.to_string(), "cir-tree node limit exceeded");
+    }
+
+    #[test]
+    fn full_traversal_rejects_child_outside_index() {
+        let mut bytes = little_endian_cir_tree_header(2);
+        bytes.extend_from_slice(&little_endian_non_leaf_node(120));
+        let mut reader = Cursor::new(bytes);
+
+        let error = cir_tree_data_blocks(
+            Endianness::Little,
+            &mut reader,
+            CirTreeIndex(CirTreeIndexType::FullData, 48, 2, Some(84)),
+            BBIDataBlockLimits::default(),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(error.to_string(), "cir-tree child node offset out of range");
     }
 
     #[test]
